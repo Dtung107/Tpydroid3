@@ -20,7 +20,7 @@ import {
   Filter,
 } from 'lucide-react';
 import { LessonItem } from '../types';
-import { sendAiLessonsRequest } from '../utils/geminiClient';
+import { sendGeminiLessons } from '../utils/geminiClient';
 
 interface StudyModalProps {
   isOpen: boolean;
@@ -135,19 +135,18 @@ export const StudyModal: React.FC<StudyModalProps> = ({
     setGeneratorSuccess('');
 
     try {
-      const existingTitles = lessons.map((l) => l.title);
-      const completedTitles = lessons.filter((l) => l.completed).map((l) => l.title);
-
-      const generatedLessons = await sendAiLessonsRequest({
-        topic: topicToUse,
-        level: aiLevel,
+      const existingTitles = lessons.map((l) => l.title).filter(Boolean);
+      const completedTitles = lessons.filter((l) => l.completed).map((l) => l.title).filter(Boolean);
+      const generatedRawLessons = await sendGeminiLessons(
+        topicToUse,
+        aiLevel,
         existingTitles,
-        completedTitles,
-      });
+        completedTitles
+      );
 
-      if (generatedLessons && Array.isArray(generatedLessons) && generatedLessons.length > 0) {
+      if (generatedRawLessons && Array.isArray(generatedRawLessons) && generatedRawLessons.length > 0) {
         // Standardize each incoming lesson item
-        const normalizedLessons: LessonItem[] = generatedLessons.map((item: any) => {
+        const normalizedLessons: LessonItem[] = generatedRawLessons.map((item: any) => {
           const info = getLevelInfo(item.level || aiLevel);
           return {
             id: item.id || `lesson_ai_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
