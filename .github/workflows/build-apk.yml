@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: 22
       - run: npm install --legacy-peer-deps --no-audit
-      - run: npm install --legacy-peer-deps --no-save @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0 @capacitor/browser@6.0.3 @capacitor/app@6.1.0
+      - run: npm install --legacy-peer-deps --save-exact @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0 @capacitor/browser@6.0.6 @capacitor/app@6.0.3
       - run: npm run build
       - run: npx cap add android || true
       - name: Add OAuth Deep Link Intent Filter
