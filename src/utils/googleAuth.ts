@@ -6,6 +6,7 @@ import {
   GoogleAuthProvider,
   onAuthStateChanged,
   User,
+  type Auth,
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
@@ -21,8 +22,14 @@ export const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
 ];
 
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+let auth: Auth | null = null;
+try {
+  const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+  auth = getAuth(app);
+} catch (err) {
+  console.warn('Firebase Auth init skipped:', err);
+}
+export { auth };
 
 const provider = new GoogleAuthProvider();
 SCOPES.forEach((scope) => provider.addScope(scope));
@@ -55,8 +62,12 @@ function clearPendingApkPromise() {
 }
 
 function getCapacitorPlugin<T = any>(name: string): T | null {
-  if (typeof window === 'undefined') return null;
-  return ((window as any).Capacitor?.Plugins?.[name] as T) || null;
+  try {
+    if (typeof window === 'undefined') return null;
+    return ((window as any).Capacitor?.Plugins?.[name] as T) || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function fetchGoogleUserProfile(accessToken: string, fallback: {
@@ -102,7 +113,9 @@ async function handleApkOAuthCallbackUrl(rawUrl: string): Promise<boolean> {
 
   const browserPlugin = getCapacitorPlugin<{ close?: () => Promise<void> }>('Browser');
   try {
-    await browserPlugin?.close?.();
+    if (browserPlugin?.close) {
+      await Promise.resolve(browserPlugin.close());
+    }
   } catch (_) {}
 
   const hashPart = rawUrl.includes('#') ? rawUrl.split('#')[1] : rawUrl.split('?')[1] || '';
@@ -135,7 +148,7 @@ async function handleApkOAuthCallbackUrl(rawUrl: string): Promise<boolean> {
   cachedAccessToken = accessToken;
   let signedUser: User | null = null;
 
-  if (idToken) {
+  if (idToken && auth) {
     try {
       const cred = GoogleAuthProvider.credential(idToken, accessToken);
       const userCred = await signInWithCredential(auth, cred);
@@ -176,57 +189,79 @@ export const initAuth = (
 ) => {
   activeCallbacks = { onAuthSuccess, onAuthSignedOutOrNeedsToken };
 
-  const unsubscribeFirebase = onAuthStateChanged(auth, (user: User | null) => {
-    const effectiveUser = user || cachedApkUser;
-    if (effectiveUser) {
-      if (cachedAccessToken) {
-        onAuthSuccess?.(effectiveUser, cachedAccessToken);
-      } else if (!isSigningIn) {
-        cachedAccessToken = null;
-        onAuthSignedOutOrNeedsToken?.(effectiveUser);
-      }
-    } else {
-      cachedAccessToken = null;
-      onAuthSignedOutOrNeedsToken?.(null);
+  let unsubscribeFirebase: () => void = () => {};
+  if (auth) {
+    try {
+      unsubscribeFirebase = onAuthStateChanged(auth, (user: User | null) => {
+        const effectiveUser = user || cachedApkUser;
+        if (effectiveUser) {
+          if (cachedAccessToken) {
+            onAuthSuccess?.(effectiveUser, cachedAccessToken);
+          } else if (!isSigningIn) {
+            cachedAccessToken = null;
+            onAuthSignedOutOrNeedsToken?.(effectiveUser);
+          }
+        } else {
+          cachedAccessToken = null;
+          onAuthSignedOutOrNeedsToken?.(null);
+        }
+      });
+    } catch (err) {
+      console.warn('onAuthStateChanged failed:', err);
     }
-  });
+  }
 
-  let appListenerHandle: { remove?: () => Promise<void> } | null = null;
+  let appListenerHandle: { remove?: () => Promise<void> | void } | null = null;
   const appPlugin = getCapacitorPlugin<{
     addListener?: (
       eventName: string,
       listenerFunc: (data: { url?: string }) => void
-    ) => Promise<{ remove: () => Promise<void> }>;
+    ) => Promise<{ remove: () => Promise<void> }> | { remove: () => Promise<void> };
     getLaunchUrl?: () => Promise<{ url?: string } | undefined>;
   }>('App');
 
-  if (appPlugin?.addListener) {
-    appPlugin
-      .addListener('appUrlOpen', (data) => {
+  if (appPlugin && typeof appPlugin.addListener === 'function') {
+    try {
+      // Capacitor native-bridge.js returns { remove } synchronously (not a Promise),
+      // while @capacitor/app JS wrapper returns a Promise<PluginListenerHandle>. Handle both!
+      const handleOrPromise = appPlugin.addListener('appUrlOpen', (data) => {
         if (data?.url) {
           handleApkOAuthCallbackUrl(data.url).catch(() => {});
         }
-      })
-      .then((handle) => {
-        appListenerHandle = handle;
-      })
-      .catch(() => {});
+      });
+      if (handleOrPromise && typeof (handleOrPromise as any).then === 'function') {
+        (handleOrPromise as Promise<{ remove?: () => Promise<void> }>)
+          .then((handle) => {
+            if (handle) appListenerHandle = handle;
+          })
+          .catch(() => {});
+      } else if (handleOrPromise && typeof (handleOrPromise as any).remove === 'function') {
+        appListenerHandle = handleOrPromise as { remove?: () => Promise<void> };
+      }
+    } catch (err) {
+      console.warn('Capacitor App.addListener skipped:', err);
+    }
   }
 
-  if (appPlugin?.getLaunchUrl) {
-    appPlugin
-      .getLaunchUrl()
-      .then((res) => {
-        if (res?.url) {
-          handleApkOAuthCallbackUrl(res.url).catch(() => {});
-        }
-      })
-      .catch(() => {});
+  if (appPlugin && typeof appPlugin.getLaunchUrl === 'function') {
+    try {
+      Promise.resolve(appPlugin.getLaunchUrl())
+        .then((res) => {
+          if (res?.url) {
+            handleApkOAuthCallbackUrl(res.url).catch(() => {});
+          }
+        })
+        .catch(() => {});
+    } catch (_) {}
   }
 
   return () => {
-    unsubscribeFirebase();
-    appListenerHandle?.remove?.().catch(() => {});
+    try {
+      unsubscribeFirebase();
+    } catch (_) {}
+    try {
+      Promise.resolve(appListenerHandle?.remove?.()).catch(() => {});
+    } catch (_) {}
   };
 };
 
@@ -238,6 +273,9 @@ export const runWebPopupForApkBridge = async (): Promise<{
   accessToken: string;
   idToken: string;
 }> => {
+  if (!auth) {
+    throw new Error('Firebase Authentication chưa sẵn sàng.');
+  }
   isSigningIn = true;
   try {
     const result = await signInWithPopup(auth, provider);
@@ -312,6 +350,9 @@ export const googleSignIn = async (): Promise<{
   }
 
   try {
+    if (!auth) {
+      throw new Error('Firebase Authentication chưa sẵn sàng.');
+    }
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
@@ -367,6 +408,8 @@ export const logout = async (): Promise<void> => {
   cachedAccessToken = null;
   cachedApkUser = null;
   clearPendingApkPromise();
-  await auth.signOut().catch(() => {});
+  if (auth) {
+    await auth.signOut().catch(() => {});
+  }
   activeCallbacks.onAuthSignedOutOrNeedsToken?.(null);
 };

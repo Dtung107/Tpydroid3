@@ -103,8 +103,12 @@ export default function App() {
     return (localStorage.getItem('pydroid_theme') as AppTheme) || 'pydroid-dark';
   });
   const [customColors, setCustomColors] = useState<SyntaxColors>(() => {
-    const saved = localStorage.getItem('pydroid_custom_colors');
-    return saved ? JSON.parse(saved) : DEFAULT_CUSTOM_COLORS;
+    try {
+      const saved = localStorage.getItem('pydroid_custom_colors');
+      return saved ? JSON.parse(saved) : DEFAULT_CUSTOM_COLORS;
+    } catch (_) {
+      return DEFAULT_CUSTOM_COLORS;
+    }
   });
 
   // Bottom Key Bar configuration

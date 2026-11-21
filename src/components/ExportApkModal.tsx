@@ -67,6 +67,7 @@ const FALLBACK_LATEST_FILES = [
   'src/components/Terminal.tsx',
   'src/components/AiAssistantModal.tsx',
   'src/App.tsx',
+  'src/main.tsx',
   'index.html',
   'server.ts',
   'firebase-applet-config.json',
