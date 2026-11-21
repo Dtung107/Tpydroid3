@@ -1,4 +1,5 @@
 import { LintError } from '../types';
+import { getApiBaseUrl, getApiHeaders, getApiUrl, isAndroidApkEnvironment } from './apiConfig';
 
 export function translatePythonErrorMessage(type: string, message: string): string {
   const msgLower = (message || '').toLowerCase();
@@ -229,10 +230,14 @@ export async function lintPythonCodeServer(code: string): Promise<LintError[]> {
   const controller = new AbortController();
   currentAbortController = controller;
 
+  if (isAndroidApkEnvironment() && !getApiBaseUrl()) {
+    return checkPythonSyntaxClient(code);
+  }
+
   try {
-    const res = await fetch('/api/python/lint', {
+    const res = await fetch(getApiUrl('/api/python/lint'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getApiHeaders(),
       body: JSON.stringify({ code }),
       signal: controller.signal,
     });

@@ -321,13 +321,21 @@ if (fs.existsSync(pyodidePath)) {
   });
 }
 
+function getKeyPrefixCategory(key: string): 'AIza' | 'AQ.' | 'OTHER' | 'NONE' {
+  const s = (key || '').replace(/[\s\u200B-\u200D\uFEFF'"]+/g, '');
+  if (!s) return 'NONE';
+  if (s.startsWith('AIza')) return 'AIza';
+  if (s.startsWith('AQ.')) return 'AQ.';
+  return 'OTHER';
+}
+
 function isValidGeminiKeyFormat(key: string): boolean {
   if (!key) return false;
   const s = key.replace(/[\s\u200B-\u200D\uFEFF'"]+/g, '');
   if (s.includes('...') || s.includes('MY_GEMINI') || s.includes('YOUR_API')) {
     return false;
   }
-  return /^[A-Za-z0-9_-]{20,}$/.test(s);
+  return /^[A-Za-z0-9_.-]{20,}$/.test(s);
 }
 
 // Initialize Gemini API dynamically so updated environment variables are always honored
@@ -340,6 +348,7 @@ function getServerEnvGeminiKey(): string {
 }
 
 let cachedClientKey = getServerEnvGeminiKey();
+let preferredApiVersion: 'v1' | 'v1beta' | undefined = undefined;
 let ai = new GoogleGenAI({
   apiKey: cachedClientKey || undefined,
   httpOptions: {
@@ -349,18 +358,24 @@ let ai = new GoogleGenAI({
   },
 });
 
+function createServerGenAiClient(apiKey: string, apiVersion?: 'v1' | 'v1beta'): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: apiKey || undefined,
+    apiVersion,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
 function getActiveAiInstance(): { client: GoogleGenAI; key: string } {
   const currentKey = getServerEnvGeminiKey();
   if (currentKey !== cachedClientKey) {
     cachedClientKey = currentKey;
-    ai = new GoogleGenAI({
-      apiKey: cachedClientKey || undefined,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
+    preferredApiVersion = undefined;
+    ai = createServerGenAiClient(cachedClientKey);
   }
   return { client: ai, key: currentKey };
 }
@@ -1959,6 +1974,15 @@ const CANDIDATE_MODELS = [
   'gemini-3.1-flash-lite',
 ];
 
+let cachedWorkingModel: string | null = null;
+
+function getOrderedCandidateModels(): string[] {
+  if (cachedWorkingModel && CANDIDATE_MODELS.includes(cachedWorkingModel)) {
+    return [cachedWorkingModel, ...CANDIDATE_MODELS.filter((m) => m !== cachedWorkingModel)];
+  }
+  return CANDIDATE_MODELS;
+}
+
 function supportsThinkingConfig(modelName: string): boolean {
   return modelName.includes('gemini-4');
 }
@@ -2004,6 +2028,13 @@ function extractFriendlyGeminiError(err: any): { friendly: string; raw: string; 
             code: 429,
           };
         }
+        if (code === 503 || msg.toLowerCase().includes('high demand') || parsed.error.status === 'UNAVAILABLE') {
+          return {
+            friendly: 'Máy chủ Google Gemini đang quá tải tạm thời (503 High Demand). Khóa API vẫn hợp lệ — vui lòng thử lại sau vài giây.',
+            raw,
+            code: 503,
+          };
+        }
         if (msg.includes('not found') || code === 404) {
           return {
             friendly: `Mô hình AI chưa được hỗ trợ trên Project này: ${msg}`,
@@ -2024,6 +2055,13 @@ function extractFriendlyGeminiError(err: any): { friendly: string; raw: string; 
       friendly: 'Máy chủ Gemini AI chưa có GEMINI_API_KEY hợp lệ từ bảng Settings > Secrets của dự án Google AI Studio.',
       raw,
       code: 401,
+    };
+  }
+  if (lower.includes('503') || lower.includes('unavailable') || lower.includes('high demand')) {
+    return {
+      friendly: 'Máy chủ Google Gemini đang quá tải tạm thời (503 High Demand). Khóa API vẫn hợp lệ — vui lòng thử lại sau vài giây.',
+      raw,
+      code: 503,
     };
   }
   if (lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('rate limit') || lower.includes('429')) {
@@ -2199,9 +2237,11 @@ async function callWithModelFallback<T>(
   fn: (modelName: string) => Promise<T>
 ): Promise<T> {
   let lastError: any = null;
-  for (const model of CANDIDATE_MODELS) {
+  for (const model of getOrderedCandidateModels()) {
     try {
-      return await fn(model);
+      const result = await fn(model);
+      cachedWorkingModel = model;
+      return result;
     } catch (err: any) {
       lastError = err;
       if (isAuthOrPermissionError(err)) {
@@ -3273,7 +3313,7 @@ app.post('/api/ai/chat/stream', async (req, res) => {
     for (const activeClient of clientsToTry) {
       if (streamed) break;
 
-      for (const model of CANDIDATE_MODELS) {
+      for (const model of getOrderedCandidateModels()) {
         const tryStream = async (useThinking: boolean): Promise<boolean> => {
           const modelConfig: any = { systemInstruction };
           if (useThinking && supportsThinkingConfig(model)) {
@@ -3300,13 +3340,19 @@ app.post('/api/ai/chat/stream', async (req, res) => {
 
         try {
           streamed = await tryStream(true);
-          if (streamed) break;
+          if (streamed) {
+            cachedWorkingModel = model;
+            break;
+          }
         } catch (streamErr: any) {
           const status = (streamErr?.status as number) || (streamErr?.statusCode as number);
           if (status === 400 && supportsThinkingConfig(model) && !isAuthOrPermissionError(streamErr)) {
             try {
               streamed = await tryStream(false);
-              if (streamed) break;
+              if (streamed) {
+                cachedWorkingModel = model;
+                break;
+              }
             } catch (retryErr: any) {
               if (isCustom && activeClient === aiClient) customError = retryErr;
               lastStreamError = retryErr;
@@ -3331,7 +3377,7 @@ app.post('/api/ai/chat/stream', async (req, res) => {
     if (!streamed) {
       for (const activeClient of clientsToTry) {
         if (streamed) break;
-        for (const model of CANDIDATE_MODELS) {
+        for (const model of getOrderedCandidateModels()) {
           try {
             const modelConfig: any = { systemInstruction };
             const resp = await withTimeout(
@@ -3343,6 +3389,7 @@ app.post('/api/ai/chat/stream', async (req, res) => {
               15000
             );
             if (resp && resp.text) {
+              cachedWorkingModel = model;
               res.write(`data: ${JSON.stringify({ text: resp.text })}\n\n`);
               streamed = true;
               break;
@@ -3470,23 +3517,39 @@ app.post('/api/ai/chat', async (req, res) => {
 app.all('/api/ai/status', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   const { aiClient, hasKey } = getAiClient(req);
+  const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || String(req.headers.host || '').includes('onrender.com'));
+  const rawEnvGemini = (process.env.GEMINI_API_KEY || '').trim();
+  const rawEnvGoogle = (process.env.GOOGLE_API_KEY || '').trim();
+  const activeRawKey = rawEnvGemini || rawEnvGoogle;
+  const keyPrefix = getKeyPrefixCategory(activeRawKey);
+
   if (!hasKey) {
     return res.json({
       ok: false,
       model: 'local-pep8-engine',
-      message: 'Máy chủ AI Studio chưa có GEMINI_API_KEY hợp lệ trong Settings > Secrets.',
+      message: isRender
+        ? 'Máy chủ Render chưa có biến môi trường GEMINI_API_KEY hợp lệ trong Render Dashboard > Environment.'
+        : 'Máy chủ AI Studio chưa nhận được GEMINI_API_KEY hợp lệ từ Settings > Secrets (hoặc khóa đang bị trống/sai định dạng).',
+      diagnostic: {
+        httpStatus: null,
+        keyPresent: false,
+        keySource: rawEnvGemini ? 'GEMINI_API_KEY' : (rawEnvGoogle ? 'GOOGLE_API_KEY' : 'NONE'),
+        keyPrefix,
+        geminiKeyLen: rawEnvGemini.length,
+        geminiKeyStartsAIza: rawEnvGemini.startsWith('AIza'),
+        geminiKeyStartsAQ: rawEnvGemini.startsWith('AQ.'),
+      },
     });
   }
 
   let lastError: any = null;
-
-  for (const model of CANDIDATE_MODELS) {
+  const pingSingleModel = async (client: GoogleGenAI, model: string): Promise<string> => {
     const tryPing = async (useThinking: boolean) => {
       const modelConfig: any = useThinking && supportsThinkingConfig(model)
         ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
         : undefined;
       return await withTimeout(
-        aiClient.models.generateContent({
+        client.models.generateContent({
           model,
           contents: 'Ping',
           config: modelConfig,
@@ -3497,54 +3560,97 @@ app.all('/api/ai/status', async (req, res) => {
 
     try {
       const response = await tryPing(true);
-      if (response && response.text) {
-        return res.json({
-          ok: true,
-          model,
-          message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${model})!`,
-        });
-      }
+      if (response && response.text) return model;
+      throw new Error('Empty response');
     } catch (e: any) {
       const status = (e?.status as number) || (e?.statusCode as number);
       if (status === 400 && supportsThinkingConfig(model) && !isAuthOrPermissionError(e)) {
-        try {
-          const retryResp = await tryPing(false);
-          if (retryResp && retryResp.text) {
-            return res.json({
-              ok: true,
-              model,
-              message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${model})!`,
-            });
-          }
-        } catch (retryErr: any) {
-          e = retryErr;
-        }
+        const retryResp = await tryPing(false);
+        if (retryResp && retryResp.text) return model;
       }
-      lastError = e;
-      if (isAuthOrPermissionError(e)) {
-        break;
-      }
+      throw e;
+    }
+  };
+
+  const pingWithClient = async (client: GoogleGenAI): Promise<{ ok: true; model: string } | { ok: false; err: any }> => {
+    const models = getOrderedCandidateModels();
+    try {
+      const winnerModel = await Promise.any(models.map((m) => pingSingleModel(client, m)));
+      cachedWorkingModel = winnerModel;
+      return { ok: true, model: winnerModel };
+    } catch (aggErr: any) {
+      const errors = Array.isArray(aggErr?.errors) ? aggErr.errors : [aggErr];
+      const authErr = errors.find((e: any) => isAuthOrPermissionError(e));
+      return { ok: false, err: authErr || errors[errors.length - 1] };
+    }
+  };
+
+  const firstAttempt = await pingWithClient(aiClient);
+  if (firstAttempt.ok) {
+    return res.json({
+      ok: true,
+      model: firstAttempt.model,
+      message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${firstAttempt.model})!`,
+    });
+  }
+  lastError = firstAttempt.err;
+
+  let keyVerified = false;
+  let modelsProbeSummary: string | undefined;
+  const serverKey = getServerEnvGeminiKey();
+  if (serverKey) {
+    try {
+      const mRes = await withTimeout(
+        fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(serverKey)}`),
+        5000
+      );
+      keyVerified = mRes.status === 200;
+      modelsProbeSummary = `v1beta/models?key=${mRes.status}`;
+    } catch (e: any) {
+      modelsProbeSummary = `v1beta/models_err:${e?.message || 'err'}`;
     }
   }
 
+  // Only probe v1beta generateContent if key is not rejected by auth or models endpoint passed
+  let betaErrorSummary: string | undefined;
+  if (serverKey && preferredApiVersion !== 'v1beta' && (!isAuthOrPermissionError(lastError) || keyVerified)) {
+    const betaClient = createServerGenAiClient(serverKey, 'v1beta');
+    const betaAttempt = await pingWithClient(betaClient);
+    if (betaAttempt.ok) {
+      preferredApiVersion = 'v1beta';
+      ai = betaClient;
+      return res.json({
+        ok: true,
+        model: betaAttempt.model,
+        message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${betaAttempt.model} • v1beta)!`,
+      });
+    }
+    betaErrorSummary = String(betaAttempt.err?.message || betaAttempt.err || '').slice(0, 200);
+  }
+
   const errorInfo = extractFriendlyGeminiError(lastError);
-  const redactedRaw = (errorInfo.raw || '').replace(/AIza[A-Za-z0-9_-]{10,}/g, '[REDACTED_KEY]');
-  const rawEnvGemini = (process.env.GEMINI_API_KEY || '').trim();
-  const rawEnvGoogle = (process.env.GOOGLE_API_KEY || '').trim();
+  const redactedRaw = (errorInfo.raw || '')
+    .replace(/AIza[A-Za-z0-9_-]{10,}/g, '[REDACTED_KEY]')
+    .replace(/AQ\.[A-Za-z0-9_.-]{10,}/g, '[REDACTED_KEY]');
   const rawEnvApiKey = (process.env.API_KEY || '').trim();
   return res.json({
     ok: false,
-    model: CANDIDATE_MODELS[0],
+    model: cachedWorkingModel || CANDIDATE_MODELS[0],
     message: `${errorInfo.friendly} Ứng dụng không có ô nhập khóa thủ công; bộ phân tích PEP 8 nội bộ vẫn sẵn sàng ngoại tuyến.`,
     diagnostic: {
       httpStatus: errorInfo.code ?? null,
       keyPresent: hasKey,
+      keyVerified,
       keySource: rawEnvGemini ? 'GEMINI_API_KEY' : (rawEnvGoogle ? 'GOOGLE_API_KEY' : 'NONE'),
+      keyPrefix,
       geminiKeyLen: rawEnvGemini.length,
       geminiKeyStartsAIza: rawEnvGemini.startsWith('AIza'),
+      geminiKeyStartsAQ: rawEnvGemini.startsWith('AQ.'),
       googleKeyLen: rawEnvGoogle.length,
       apiKeyLen: rawEnvApiKey.length,
       apiKeyStartsAIza: rawEnvApiKey.startsWith('AIza'),
+      betaErrorSummary: (betaErrorSummary || '').replace(/AIza[A-Za-z0-9_-]{10,}|AQ\.[A-Za-z0-9_.-]{10,}/g, '[REDACTED_KEY]'),
+      modelsProbeSummary,
       rawError: redactedRaw.slice(0, 350),
     },
   });
