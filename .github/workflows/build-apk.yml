@@ -34,10 +34,10 @@ jobs:
             yes | sdkmanager --licenses >/dev/null 2>&1 || true
           fi
 
-      - name: 4. Setup Node.js 24
-        uses: actions/setup-node@v5
+      - name: 4. Setup Node.js 20
+        uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 20
 
       - name: 5. Install Dependencies
         run: |
@@ -102,7 +102,7 @@ jobs:
           ls -lh output-apk/app-debug.apk
 
       - name: 12. Upload APK Artifact (Download on Phone)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: Pydroid3-Android-APK
           path: output-apk/app-debug.apk
