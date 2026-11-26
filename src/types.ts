@@ -1,6 +1,16 @@
 export type ExecutionEngine = 'cpython' | 'pyodide';
 
-export type AppTheme = 'pydroid-dark' | 'amoled-black' | 'monokai' | 'cyberpunk' | 'custom';
+export type UiTheme = 'midnight-obsidian' | 'neon-noir' | 'graphite-gold';
+
+export type AppTheme =
+  | 'midnight-obsidian'
+  | 'neon-noir'
+  | 'graphite-gold'
+  | 'pydroid-dark'
+  | 'amoled-black'
+  | 'monokai'
+  | 'cyberpunk'
+  | 'custom';
 
 export interface SyntaxColors {
   keyword: string;
@@ -70,6 +80,21 @@ export interface SavedFile {
   code: string;
   lastModified: number;
 }
+
+export type SnippetCategory = 'template' | 'algorithm' | 'utility' | 'data' | 'custom';
+
+export interface SnippetItem {
+  id: string;
+  title: string;
+  code: string;
+  description?: string;
+  category: SnippetCategory;
+  tags?: string[];
+  isFavorite?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 
 export interface ChatMessage {
   id: string;

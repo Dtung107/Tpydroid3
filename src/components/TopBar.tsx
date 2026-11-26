@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import {
   Play,
   Square,
@@ -13,9 +13,16 @@ import {
   Bug,
   ChevronUp,
   ChevronDown,
+  FileCode2,
+  Search,
+  X,
+  Check,
 } from 'lucide-react';
-import type { User as FirebaseUser } from 'firebase/auth';
 import { ExecutionEngine } from '../types';
+import {
+  PYTHON_BOILERPLATE_SNIPPETS,
+  BoilerplateSnippet,
+} from '../constants/defaultKeys';
 
 interface TopBarProps {
   activeTab: 'editor' | 'terminal';
@@ -33,14 +40,14 @@ interface TopBarProps {
   onToggleFullscreen: () => void;
   onOpenAiAssistant: () => void;
   onOpenAutoFix?: () => void;
-  onOpenExportApk?: () => void;
+  onOpenGoogleWorkspace?: () => void;
+  isGoogleSignedIn?: boolean;
   engine?: ExecutionEngine;
   onToggleEngine?: () => void;
   isTopBarCollapsed?: boolean;
   onToggleCollapseTopBar?: () => void;
-  googleUser?: FirebaseUser | null;
-  googleAccessToken?: string | null;
-  onOpenGoogleAccount?: () => void;
+  onInsertBoilerplate?: (code: string) => void;
+  onPinBoilerplate?: (snippet: BoilerplateSnippet) => string | void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -59,16 +66,67 @@ export const TopBar: React.FC<TopBarProps> = ({
   onToggleFullscreen,
   onOpenAiAssistant,
   onOpenAutoFix,
-  onOpenExportApk,
+  onOpenGoogleWorkspace,
+  isGoogleSignedIn,
   engine,
   onToggleEngine,
   isTopBarCollapsed,
   onToggleCollapseTopBar,
-  googleUser,
-  googleAccessToken,
-  onOpenGoogleAccount,
+  onInsertBoilerplate,
+  onPinBoilerplate,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [showBoilerplateMenu, setShowBoilerplateMenu] = useState(false);
+  const [boilerplateCategory, setBoilerplateCategory] = useState<
+    'all' | 'control' | 'structure' | 'loop_io'
+  >('all');
+  const [boilerplateSearch, setBoilerplateSearch] = useState('');
+  const [pinNotice, setPinNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!showBoilerplateMenu) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowBoilerplateMenu(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showBoilerplateMenu]);
+
+  useEffect(() => {
+    if (!pinNotice) return;
+    const timer = setTimeout(() => setPinNotice(null), 3200);
+    return () => clearTimeout(timer);
+  }, [pinNotice]);
+
+  const handleSelectSnippet = (snippet: BoilerplateSnippet) => {
+    setShowBoilerplateMenu(false);
+    onInsertBoilerplate?.(snippet.code);
+  };
+
+  const handlePinSnippet = (snippet: BoilerplateSnippet) => {
+    if (!onPinBoilerplate) return;
+    const feedback = onPinBoilerplate(snippet);
+    if (typeof feedback === 'string' && feedback) {
+      setPinNotice(feedback);
+    }
+  };
+
+  const filteredBoilerplates = PYTHON_BOILERPLATE_SNIPPETS.filter((item) => {
+    if (boilerplateCategory !== 'all' && item.category !== boilerplateCategory) {
+      return false;
+    }
+    if (boilerplateSearch.trim()) {
+      const q = boilerplateSearch.toLowerCase().trim();
+      return (
+        item.title.toLowerCase().includes(q) ||
+        item.description.toLowerCase().includes(q) ||
+        item.code.toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
 
   if (isTopBarCollapsed) {
     return (
@@ -105,7 +163,6 @@ export const TopBar: React.FC<TopBarProps> = ({
             <span>{activeTab === 'editor' ? 'Editor' : 'Terminal'}</span>
             <span className="text-[9px] opacity-75">➔</span>
           </button>
-
         </div>
 
         {onToggleCollapseTopBar && (
@@ -186,6 +243,24 @@ export const TopBar: React.FC<TopBarProps> = ({
         className="flex-1 h-full flex items-center px-2 space-x-2 overflow-x-auto overflow-y-hidden touch-pan-x scroll-smooth [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden flex-nowrap"
         style={{ WebkitOverflowScrolling: 'touch' }}
       >
+        {/* 0. 🧩 Nút Mẫu Boilerplate (Phía bên trái phím Trợ lý AI) */}
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setShowBoilerplateMenu((prev) => !prev)}
+          className={`h-8 min-w-[38px] px-2.5 flex items-center justify-center space-x-1 rounded-lg border-2 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer group font-sans text-xs font-extrabold ${
+            showBoilerplateMenu
+              ? 'bg-sky-400 text-slate-950 border-sky-200 shadow-none translate-y-0.5'
+              : 'bg-gradient-to-b from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white border-sky-300 shadow-[0_2px_0_0_#0c4a6e] hover:border-sky-200'
+          }`}
+          title="Chèn nhanh đoạn mã Python mẫu (try-except, if __name__ == '__main__':, def, class...)"
+          aria-label="Chèn nhanh đoạn mã mẫu Python"
+          aria-expanded={showBoilerplateMenu}
+        >
+          <FileCode2 className="w-4 h-4 shrink-0 group-hover:scale-110 transition-transform" />
+          <span>Mẫu</span>
+        </button>
+
         {/* 1. ✨ Nút Trợ lý AI */}
         <button
           onClick={onOpenAiAssistant}
@@ -229,6 +304,27 @@ export const TopBar: React.FC<TopBarProps> = ({
           <FolderOpen className="w-4 h-4 text-sky-400 group-hover:text-sky-200 group-hover:scale-110 transition-all drop-shadow-[0_0_6px_rgba(56,189,248,0.8)]" />
         </button>
 
+        {/* 3.5 🌐 Nút Google Drive, Ghi chú & Tài khoản Google */}
+        {onOpenGoogleWorkspace && (
+          <button
+            onClick={onOpenGoogleWorkspace}
+            className="h-8 min-w-[38px] px-2 flex items-center justify-center bg-gradient-to-b from-[#1f2937] to-[#111827] hover:from-[#2c384a] hover:to-[#1a2232] rounded-lg border-2 border-sky-400/70 shadow-[0_2px_0_0_#071b2d] hover:border-sky-300 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer relative group"
+            title={isGoogleSignedIn ? 'Google Drive, Ghi chú Cloud & Google Tasks (Đã kết nối)' : 'Đăng nhập Google (Drive, Ghi chú, Tasks)'}
+          >
+            <svg viewBox="0 0 48 48" className="w-4 h-4 group-hover:scale-110 transition-transform">
+              <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+              <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+              <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+              <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+            </svg>
+            <span
+              className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border border-black ${
+                isGoogleSignedIn ? 'bg-emerald-400' : 'bg-gray-500'
+              }`}
+            />
+          </button>
+        )}
+
         {/* 4. 🚮 Nút Thùng rác xóa nhanh mã nguồn */}
         <button
           onClick={onClearCode}
@@ -238,7 +334,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           <Trash2 className="w-4 h-4 text-rose-400 group-hover:text-rose-200 group-hover:scale-110 transition-all drop-shadow-[0_0_6px_rgba(244,63,94,0.8)]" />
         </button>
 
-        {/* 5. ⚙️ Nút Bánh răng Cài đặt */}
+        {/* 6. ⚙️ Nút Bánh răng Cài đặt */}
         <button
           onClick={onOpenSettings}
           className="h-8 min-w-[38px] px-2.5 flex items-center justify-center bg-gradient-to-b from-[#482b13] to-[#331e0c] hover:from-[#613a1a] hover:to-[#452810] text-amber-300 hover:text-white rounded-lg border-2 border-amber-500 shadow-[0_2px_0_0_#211206] hover:border-amber-400 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer group"
@@ -246,47 +342,6 @@ export const TopBar: React.FC<TopBarProps> = ({
         >
           <Settings className="w-4 h-4 text-amber-400 group-hover:text-amber-200 group-hover:rotate-45 transition-all drop-shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
         </button>
-
-        {/* 6. 👤 Tài khoản Google & Drive */}
-        {onOpenGoogleAccount && (
-          <button
-            onClick={onOpenGoogleAccount}
-            className={`h-8 min-w-[38px] px-2 flex items-center justify-center rounded-lg border-2 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer relative ${
-              googleUser && googleAccessToken
-                ? 'bg-[#102920] hover:bg-[#16382b] border-emerald-400/80 text-emerald-200 shadow-[0_2px_0_0_#064e3b]'
-                : googleUser
-                ? 'bg-[#2a2114] hover:bg-[#3a2d1b] border-amber-400/70 text-amber-200 shadow-[0_2px_0_0_#451a03]'
-                : 'bg-[#191d2b] hover:bg-[#23293d] border-sky-400/60 text-sky-200 shadow-[0_2px_0_0_#0c1a30]'
-            }`}
-            title={
-              googleUser
-                ? `Tài khoản Google: ${googleUser.displayName || googleUser.email || 'Đã đăng nhập'}`
-                : 'Đăng nhập tài khoản Google & Google Drive'
-            }
-          >
-            {googleUser?.photoURL ? (
-              <img
-                src={googleUser.photoURL}
-                alt={googleUser.displayName || 'Google'}
-                className="w-5 h-5 rounded-full object-cover border border-white/30"
-                referrerPolicy="no-referrer"
-              />
-            ) : (
-              <span className="text-xs font-black tracking-tight">
-                {googleUser ? (googleUser.displayName?.[0] || googleUser.email?.[0] || 'G').toUpperCase() : 'G'}
-              </span>
-            )}
-            <span
-              className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border border-black ${
-                googleUser && googleAccessToken
-                  ? 'bg-emerald-400'
-                  : googleUser
-                  ? 'bg-amber-400'
-                  : 'bg-sky-400'
-              }`}
-            />
-          </button>
-        )}
 
         {/* 7. ▴ Nút Thu gọn thanh công cụ (Nằm trong thanh trược) */}
         {onToggleCollapseTopBar && (
@@ -299,6 +354,161 @@ export const TopBar: React.FC<TopBarProps> = ({
           </button>
         )}
       </div>
+
+      {/* Bảng chọn nhanh đoạn mã Python boilerplate nổi ngay dưới TopBar */}
+      {showBoilerplateMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => setShowBoilerplateMenu(false)}
+            aria-hidden="true"
+          />
+          <div
+            role="dialog"
+            aria-label="Chèn nhanh đoạn mã Python mẫu"
+            style={{ top: 'calc(env(safe-area-inset-top, 0px) + 48px)' }}
+            className="fixed left-2 right-2 sm:right-auto sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] max-w-[calc(100vw-16px)] bg-[#181724] border border-[#3a3858] rounded-xl shadow-2xl z-50 overflow-hidden font-sans flex flex-col max-h-[68vh]"
+          >
+            {/* Header & Search */}
+            <div className="p-3 border-b border-[#2b2940] bg-[#1e1d2d] space-y-2.5 shrink-0">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <FileCode2 className="w-4 h-4 text-sky-400 shrink-0" />
+                  <h4 className="text-xs font-bold text-gray-100">
+                    Chèn nhanh đoạn mã Python
+                  </h4>
+                </div>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setShowBoilerplateMenu(false)}
+                  className="p-1 text-gray-400 hover:text-white rounded-md hover:bg-white/10 transition cursor-pointer"
+                  aria-label="Đóng bảng mẫu mã"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-2" />
+                <input
+                  type="text"
+                  value={boilerplateSearch}
+                  onChange={(e) => setBoilerplateSearch(e.target.value)}
+                  placeholder="Tìm nhanh: try, __main__, def, class, with..."
+                  className="w-full pl-8 pr-3 py-1.5 bg-[#12111b] border border-[#312f4a] rounded-lg text-xs text-gray-100 placeholder:text-gray-500 focus:outline-none focus:border-sky-400"
+                />
+              </div>
+
+              <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {[
+                  { id: 'all', label: 'Tất cả' },
+                  { id: 'control', label: 'Lỗi & Điều kiện' },
+                  { id: 'structure', label: 'Hàm & Lớp' },
+                  { id: 'loop_io', label: 'Vòng lặp & Tệp' },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setBoilerplateCategory(tab.id as any)}
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition shrink-0 cursor-pointer ${
+                      boilerplateCategory === tab.id
+                        ? 'bg-sky-500 text-slate-950'
+                        : 'bg-[#141320] text-gray-400 hover:text-gray-200 hover:bg-[#252338]'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {pinNotice && (
+              <div className="px-3 py-1.5 bg-emerald-950/80 border-b border-emerald-600/40 text-[11px] text-emerald-300 flex items-center justify-between shrink-0">
+                <span className="flex items-center gap-1.5 font-semibold truncate">
+                  <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span className="truncate">{pinNotice}</span>
+                </span>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setPinNotice(null)}
+                  className="text-emerald-300/70 hover:text-emerald-100 ml-2 shrink-0 cursor-pointer"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+
+            {/* Snippet Items */}
+            <div className="p-2.5 overflow-y-auto space-y-2">
+              {filteredBoilerplates.length === 0 ? (
+                <div className="py-6 text-center text-xs text-gray-400">
+                  Không tìm thấy đoạn mã phù hợp.
+                </div>
+              ) : (
+                filteredBoilerplates.map((snippet) => (
+                  <div
+                    key={snippet.id}
+                    className="rounded-lg border border-[#2d2b44] bg-[#13121e] hover:border-sky-400/70 transition overflow-hidden"
+                  >
+                    <div className="flex items-center justify-between gap-2 px-3 pt-2.5 pb-1.5">
+                      <button
+                        type="button"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => handleSelectSnippet(snippet)}
+                        className="flex-1 text-left min-w-0 cursor-pointer group"
+                      >
+                        <div className="text-xs font-bold text-sky-300 group-hover:text-sky-200 font-mono truncate">
+                          {snippet.title}
+                        </div>
+                        <div className="text-[11px] text-gray-400 truncate mt-0.5">
+                          {snippet.description}
+                        </div>
+                      </button>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {onPinBoilerplate && (
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => handlePinSnippet(snippet)}
+                            className="px-2 py-1 text-[10px] font-semibold text-gray-300 hover:text-amber-300 bg-[#1e1d2e] hover:bg-[#2a2840] border border-[#35334f] rounded-md transition cursor-pointer"
+                            title="Ghim mẫu này thành phím bấm trực tiếp trên thanh phím tắt"
+                          >
+                            + Ghim
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => handleSelectSnippet(snippet)}
+                          className="px-2.5 py-1 text-[11px] font-bold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-md transition cursor-pointer"
+                        >
+                          Chèn
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleSelectSnippet(snippet)}
+                      className="w-full text-left px-3 pb-2.5 cursor-pointer"
+                    >
+                      <pre className="p-2 rounded-md bg-[#0c0b14] border border-white/5 text-[11px] leading-snug font-mono text-gray-200 overflow-x-auto whitespace-pre">
+                        {snippet.code.trimEnd()}
+                      </pre>
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </header>
   );
 };

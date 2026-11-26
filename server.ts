@@ -1,12 +1,12 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type, Modality, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel, Modality, LiveServerMessage } from '@google/genai';
 
 dotenv.config();
 
@@ -21,34 +21,25 @@ process.on('unhandledRejection', (reason) => {
 
 const app = express();
 const server = createServer(app);
+
+// Extract --port from CLI arguments or fallback to 3000 in dev mode
+const portArgIndex = process.argv.indexOf('--port');
+const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
 const isProd = process.env.NODE_ENV === 'production';
-// In AI Studio, the application container MUST strictly listen on port 3000 in both development and production.
-// Port 8080 is reserved for the platform's nginx reverse-proxy sidecar, which proxies to app-container on port 3000.
-const PORT = 3000;
+const PORT = cliPort || (!isProd ? 3000 : (Number(process.env.PORT) || 3000));
 
-// Instant health check endpoints for Cloud Run & Nginx probes
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
+app.use(express.json({ limit: '10mb' }));
 
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ ok: true, status: 'healthy', timestamp: Date.now() });
-});
-
-// Universal CORS handler for Android APK (Capacitor/WebView) and Web
+// CORS middleware for Android APK and cross-origin WebView requests
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, Pragma');
-  res.setHeader('Access-Control-Expose-Headers', '*');
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
+    return res.sendStatus(200);
   }
   next();
 });
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Persistent Python Packages Storage in Workspace
 const PYDROID_PACKAGES_DIR = path.resolve(process.cwd(), '.pydroid_packages');
@@ -61,60 +52,92 @@ try {
   }
 } catch (_) {}
 
-// Ensure PYTHONPATH globally contains .pydroid_packages for all child processes
-const curPythonPath = process.env.PYTHONPATH || '';
-if (!curPythonPath.includes(PYDROID_PACKAGES_DIR)) {
-  process.env.PYTHONPATH = curPythonPath ? `${PYDROID_PACKAGES_DIR}:${curPythonPath}` : PYDROID_PACKAGES_DIR;
-}
-
-// Global .pth and sitecustomize registration to ensure python3 always loads .pydroid_packages
-function setupPthFiles() {
-  const pthTargets = [
-    '/usr/local/lib/python3.10/dist-packages/pydroid.pth',
-    '/usr/lib/python3/dist-packages/pydroid.pth',
-    '/usr/local/lib/python3/dist-packages/pydroid.pth',
-  ];
-  for (const p of pthTargets) {
-    try {
-      const dir = path.dirname(p);
-      if (fs.existsSync(dir)) {
-        fs.writeFileSync(p, `${PYDROID_PACKAGES_DIR}\n`, 'utf-8');
-      }
-    } catch (_) {}
-  }
-
-  // Also setup sitecustomize.py so every python3 process automatically has .pydroid_packages in sys.path
-  const sitecustomizeCode = `# Auto-configured by Pydroid 3 Web
-import sys, os
-p = '${PYDROID_PACKAGES_DIR}'
-if os.path.exists(p) and p not in sys.path:
-    sys.path.insert(0, p)
-`;
-  const siteTargets = [
-    '/usr/local/lib/python3.10/dist-packages/sitecustomize.py',
-    '/usr/lib/python3.10/sitecustomize.py',
-  ];
-  for (const s of siteTargets) {
-    try {
-      const dir = path.dirname(s);
-      if (fs.existsSync(dir)) {
-        fs.writeFileSync(s, sitecustomizeCode, 'utf-8');
-      }
-    } catch (_) {}
+// Ensure PYTHONPATH globally contains .pydroid_packages and system dist-packages
+const extraPythonPaths = [
+  PYDROID_PACKAGES_DIR,
+  '/usr/local/lib/python3.10/dist-packages',
+  '/usr/local/lib/python3/dist-packages',
+];
+for (const p of extraPythonPaths) {
+  if (fs.existsSync(p) && !(process.env.PYTHONPATH || '').includes(p)) {
+    process.env.PYTHONPATH = process.env.PYTHONPATH ? `${p}:${process.env.PYTHONPATH}` : p;
   }
 }
-setupPthFiles();
+
+function ensureEssentialPackageFixes() {
+  try {
+    const pyfigletDir = path.join(PYDROID_PACKAGES_DIR, 'pyfiglet');
+    if (fs.existsSync(pyfigletDir)) {
+      const initFile = path.join(pyfigletDir, '__init__.py');
+      if (!fs.existsSync(initFile)) {
+        try {
+          spawnSync('pip', ['install', '--target=.pydroid_packages', '--upgrade', '--no-deps', 'pyfiglet']);
+        } catch (_) {}
+      }
+      const versionFile = path.join(pyfigletDir, 'version.py');
+      if (!fs.existsSync(versionFile)) {
+        fs.writeFileSync(versionFile, '__version__ = "1.0.4"\n', 'utf-8');
+      }
+      const fontsDir = path.join(pyfigletDir, 'fonts');
+      if (fs.existsSync(fontsDir)) {
+        const stdFont = path.join(fontsDir, 'standard.flf');
+        const altFont = path.join(fontsDir, '3-d.flf');
+        if (!fs.existsSync(stdFont) && fs.existsSync(altFont)) {
+          fs.copyFileSync(altFont, stdFont);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Error applying package fixes:', e);
+  }
+}
+ensureEssentialPackageFixes();
 
 function loadPersistedPackages(): Array<{ name: string; version: string; installedAt?: string }> {
+  ensureEssentialPackageFixes();
+  const result: Array<{ name: string; version: string; installedAt?: string }> = [];
+  const seen = new Set<string>();
+
   try {
     if (fs.existsSync(REGISTRY_FILE)) {
       const data = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf-8'));
-      if (Array.isArray(data)) return data;
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          if (item && item.name && !seen.has(item.name.toLowerCase())) {
+            seen.add(item.name.toLowerCase());
+            result.push(item);
+          }
+        }
+      }
     }
   } catch (e) {
-    console.log('Notice reading installed_packages.json:', e);
+    console.warn('Error reading installed_packages.json:', e);
   }
-  return [];
+
+  // Scan persistent directory for packages that exist on disk
+  const defaultDiskPkgs = [
+    { name: 'pyfiglet', version: '1.0.4' },
+    { name: 'colorama', version: '0.4.6' },
+  ];
+  let updatedDisk = false;
+  for (const dp of defaultDiskPkgs) {
+    const pkgFolder = path.join(PYDROID_PACKAGES_DIR, dp.name);
+    if (fs.existsSync(pkgFolder) && !seen.has(dp.name.toLowerCase())) {
+      seen.add(dp.name.toLowerCase());
+      result.push({ name: dp.name, version: dp.version, installedAt: new Date().toISOString() });
+      updatedDisk = true;
+    }
+  }
+
+  if (updatedDisk) {
+    try {
+      fs.writeFileSync(REGISTRY_FILE, JSON.stringify(result, null, 2), 'utf-8');
+      const reqLines = result.map((p) => (p.version && p.version !== 'installed' ? `${p.name}==${p.version}` : p.name));
+      fs.writeFileSync(REQUIREMENTS_FILE, reqLines.join('\n') + '\n', 'utf-8');
+    } catch (_) {}
+  }
+
+  return result;
 }
 
 function savePersistedPackage(pkgName: string, version: string = 'installed') {
@@ -129,9 +152,8 @@ function savePersistedPackage(pkgName: string, version: string = 'installed') {
     // Also update requirements.txt
     const reqLines = current.map((p) => (p.version && p.version !== 'installed' ? `${p.name}==${p.version}` : p.name));
     fs.writeFileSync(REQUIREMENTS_FILE, reqLines.join('\n') + '\n', 'utf-8');
-    setupPthFiles();
   } catch (e) {
-    console.log('Notice saving to installed_packages.json:', e);
+    console.warn('Error saving to installed_packages.json:', e);
   }
 }
 
@@ -142,109 +164,7 @@ function removePersistedPackage(pkgName: string) {
     const reqLines = current.map((p) => (p.version && p.version !== 'installed' ? `${p.name}==${p.version}` : p.name));
     fs.writeFileSync(REQUIREMENTS_FILE, reqLines.join('\n') + '\n', 'utf-8');
   } catch (e) {
-    console.log('Notice removing from installed_packages.json:', e);
-  }
-}
-
-// Auto-install missing module on-the-fly when code execution catches ModuleNotFoundError
-async function autoInstallMissingModule(modName: string): Promise<boolean> {
-  const cleanMod = modName.trim().replace(/^['"]+|['"]+$/g, '');
-  if (!/^[a-zA-Z0-9_\-]+$/.test(cleanMod)) return false;
-
-  console.log(`[Auto-Fix] Phát hiện thiếu thư viện '${cleanMod}'. Đang tự động khôi phục tức thời...`);
-  await ensurePipReady(true);
-
-  return new Promise((resolve) => {
-    const py = spawn('python3', [
-      '-m',
-      'pip',
-      'install',
-      '--target',
-      PYDROID_PACKAGES_DIR,
-      '--prefer-binary',
-      '--no-cache-dir',
-      '--no-warn-script-location',
-      cleanMod,
-      '--break-system-packages',
-    ], {
-      env: { ...process.env, PYTHONPATH: PYDROID_PACKAGES_DIR },
-    });
-    py.on('close', (code) => {
-      if (code === 0) {
-        savePersistedPackage(cleanMod, 'installed');
-        setupPthFiles();
-        resolve(true);
-      } else {
-        resolve(false);
-      }
-    });
-    py.on('error', () => resolve(false));
-  });
-}
-
-// Background sync on startup to guarantee pyfiglet and all packages are ready
-async function syncPersistentPackages() {
-  setupPthFiles();
-  await ensurePipReady(true);
-
-  const persisted = loadPersistedPackages();
-  // Ensure pyfiglet is registered
-  if (!persisted.some((p) => p.name.toLowerCase() === 'pyfiglet')) {
-    savePersistedPackage('pyfiglet', '1.0.4');
-  }
-  // Ensure colorama is registered
-  if (!persisted.some((p) => p.name.toLowerCase() === 'colorama')) {
-    savePersistedPackage('colorama', '0.4.6');
-  }
-
-  const allPackages = loadPersistedPackages();
-  for (const item of allPackages) {
-    const pkgDir = path.join(PYDROID_PACKAGES_DIR, item.name);
-    if (!fs.existsSync(pkgDir)) {
-      console.log(`[Startup Sync] Tự động phục hồi thư viện ${item.name} (${item.version})...`);
-      await new Promise<void>((resolve) => {
-        const py = spawn('python3', [
-          '-m',
-          'pip',
-          'install',
-          '--target',
-          PYDROID_PACKAGES_DIR,
-          '--prefer-binary',
-          '--no-cache-dir',
-          '--no-warn-script-location',
-          item.name,
-          '--break-system-packages',
-        ], {
-          env: { ...process.env, PYTHONPATH: PYDROID_PACKAGES_DIR },
-        });
-        py.on('close', () => resolve());
-        py.on('error', () => resolve());
-      });
-    }
-  }
-}
-syncPersistentPackages().catch(() => {});
-
-// Ensure any imported third-party modules (like pyfiglet) are ready before execution
-async function ensureImportedModulesReady(code: string) {
-  setupPthFiles();
-  const match = code.match(/(?:^|\n)\s*(?:import|from)\s+([a-zA-Z0-9_]+)/g);
-  if (!match) return;
-  const mods = match.map((m) => m.replace(/^(?:\n|\s)*(?:import|from)\s+/, '').trim());
-  const persisted = loadPersistedPackages();
-  const knownMods = new Set<string>(['pyfiglet', 'colorama']);
-  for (const p of persisted) {
-    if (p && p.name) knownMods.add(p.name.toLowerCase());
-  }
-
-  for (const mod of mods) {
-    const lower = mod.toLowerCase();
-    if (knownMods.has(lower)) {
-      const p = path.join(PYDROID_PACKAGES_DIR, mod);
-      if (!fs.existsSync(p)) {
-        await autoInstallMissingModule(mod);
-      }
-    }
+    console.warn('Error removing from installed_packages.json:', e);
   }
 }
 
@@ -260,44 +180,237 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve local Pyodide WebAssembly package statically with correct MIME types and CORS
+// Endpoint to export/download entire project source code as clean ZIP for GitHub and APK building
+app.get('/api/export-project-zip', (req, res) => {
+  const zipPath = path.join(os.tmpdir(), `pydroid3-android-source-${Date.now()}.zip`);
+  const pythonScript = `
+import zipfile, os
+
+ignore_dirs = {'node_modules', '.git', '.pydroid_packages', 'tmp', 'dist', 'build', '.idea', '.gradle', '.aistudio'}
+ignore_files = {'.DS_Store', 'server.js'}
+
+with zipfile.ZipFile('${zipPath}', 'w', zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk('.'):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs and d != '.git']
+        for f in files:
+            if f in ignore_files or f.endswith('.pyc') or f.endswith('.log') or 'pydroid3-android-source.zip_' in f:
+                continue
+            file_path = os.path.join(root, f)
+            arcname = os.path.relpath(file_path, '.')
+            zf.write(file_path, arcname)
+`;
+
+  try {
+    const tempPy = path.join(os.tmpdir(), `make_zip_${Date.now()}.py`);
+    fs.writeFileSync(tempPy, pythonScript, 'utf-8');
+    const proc = spawn('python3', [tempPy]);
+    proc.on('close', (code) => {
+      try { if (fs.existsSync(tempPy)) fs.unlinkSync(tempPy); } catch (_) {}
+      if (code === 0 && fs.existsSync(zipPath)) {
+        res.download(zipPath, 'pydroid3-android-source.zip', (err) => {
+          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (_) {}
+        });
+      } else {
+        res.status(500).json({ error: 'Không thể tạo file zip' });
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint to automatically push complete codebase to GitHub directly from Android phone without a PC
+app.post('/api/github/push-repo', async (req, res) => {
+  const { token, repoName = 'pydroid3-android' } = req.body;
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'Vui lòng cung cấp mã GitHub Personal Access Token.' });
+  }
+
+  // Clean and sanitize token (strip zero-width chars, quotes, auth prefixes)
+  let cleanToken = token.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  cleanToken = cleanToken.replace(/^['"]+|['"]+$/g, '').trim();
+  cleanToken = cleanToken.replace(/^(authorization:\s*)?(bearer|token)\s+/i, '').trim();
+
+  if (!cleanToken || /\s/.test(cleanToken)) {
+    return res.status(400).json({ error: 'Mã GitHub Personal Access Token không hợp lệ hoặc chứa khoảng trắng.' });
+  }
+
+  const cleanRepoName = (repoName.trim() || 'pydroid3-android').replace(/[^a-zA-Z0-9._-]/g, '-');
+
+  try {
+    // 1. Verify user authentication with GitHub REST API using Bearer auth
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${cleanToken}`,
+        'User-Agent': 'Pydroid3-Web-Builder',
+        Accept: 'application/vnd.github.v3+json',
+      },
+    });
+
+    if (!userRes.ok) {
+      const errData = await userRes.json().catch(() => ({}));
+      const errMsg = errData.message || '';
+      console.warn('GitHub /user auth rejected:', userRes.status, errMsg);
+
+      if (userRes.status === 401) {
+        return res.status(401).json({
+          error: 'Mã GitHub Token không chính xác hoặc đã hết hạn (GitHub: ' + (errMsg || 'Bad credentials') + '). Vui lòng kiểm tra lại mã token hoặc bấm liên kết "Lấy Token" để tạo mã mới.',
+        });
+      }
+      return res.status(userRes.status).json({
+        error: `GitHub từ chối xác thực (HTTP ${userRes.status}): ${errMsg || 'Vui lòng kiểm tra lại token'}.`,
+      });
+    }
+
+    // Inspect granted scopes if available (classic PATs return x-oauth-scopes)
+    const scopesHeader = userRes.headers.get('x-oauth-scopes');
+    if (scopesHeader !== null) {
+      const scopes = scopesHeader.split(',').map((s) => s.trim().toLowerCase());
+      const hasRepo = scopes.includes('repo') || scopes.includes('public_repo');
+      if (!hasRepo && scopes.length > 0) {
+        return res.status(403).json({
+          error: `Token của bạn chỉ có quyền [${scopes.join(', ')}], đang thiếu quyền "repo" để tạo và tải lên mã nguồn. Vui lòng bấm vào liên kết "Lấy Token (đã chọn repo + workflow)" để tạo lại token có đủ quyền.`,
+        });
+      }
+    }
+
+    const userData = await userRes.json();
+    const username = userData.login;
+
+    // 2. Check if repository already exists; if not, create it automatically
+    const checkRepoRes = await fetch(`https://api.github.com/repos/${username}/${cleanRepoName}`, {
+      headers: {
+        Authorization: `Bearer ${cleanToken}`,
+        'User-Agent': 'Pydroid3-Web-Builder',
+        Accept: 'application/vnd.github.v3+json',
+      },
+    });
+
+    if (checkRepoRes.status === 404) {
+      // Create new repo
+      const createRepoRes = await fetch('https://api.github.com/user/repos', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cleanToken}`,
+          'User-Agent': 'Pydroid3-Web-Builder',
+          Accept: 'application/vnd.github.v3+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: cleanRepoName,
+          description: 'Pydroid 3 Web IDE - Android APK build via GitHub Actions',
+          private: false,
+          auto_init: false,
+        }),
+      });
+
+      if (!createRepoRes.ok) {
+        const errData = await createRepoRes.json().catch(() => ({}));
+        return res.status(createRepoRes.status).json({
+          error: errData.message || 'Không thể tạo repository mới trên GitHub. Vui lòng kiểm tra quyền hạn của Token.',
+        });
+      }
+    }
+
+    // 3. Prepare pristine codebase copy in /tmp for clean git push
+    const exportDir = path.join(os.tmpdir(), `gh_push_${Date.now()}`);
+    const pythonScript = `
+import os, shutil
+
+ignore_dirs = {'node_modules', '.git', '.pydroid_packages', 'tmp', 'dist', 'build', '.idea', '.gradle', '.aistudio'}
+ignore_files = {'.DS_Store', 'server.js', 'test_pyodide_input.cjs', 'test_pyodide_input.js'}
+
+dest_dir = '${exportDir}'
+if os.path.exists(dest_dir):
+    shutil.rmtree(dest_dir)
+os.makedirs(dest_dir)
+
+for root, dirs, files in os.walk('.'):
+    dirs[:] = [d for d in dirs if d not in ignore_dirs and d != '.git']
+    rel_root = os.path.relpath(root, '.')
+    target_dir = os.path.join(dest_dir, rel_root)
+    os.makedirs(target_dir, exist_ok=True)
+    for f in files:
+        if f in ignore_files or f.endswith('.pyc') or f.endswith('.log') or 'pydroid3-android-source.zip_' in f:
+            continue
+        src_path = os.path.join(root, f)
+        dest_path = os.path.join(target_dir, f)
+        shutil.copy2(src_path, dest_path)
+`;
+
+    const pyFile = path.join(os.tmpdir(), `copy_${Date.now()}.py`);
+    fs.writeFileSync(pyFile, pythonScript, 'utf-8');
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('python3', [pyFile]);
+      proc.on('close', (code) => {
+        try { if (fs.existsSync(pyFile)) fs.unlinkSync(pyFile); } catch (_) {}
+        if (code === 0) resolve();
+        else reject(new Error('Lỗi sao chép tệp dự án'));
+      });
+    });
+
+    // 4. Git init, config, commit and push to user's GitHub using standard x-access-token auth
+    const commands = [
+      `cd "${exportDir}"`,
+      `git init -b main`,
+      `git config user.name "${userData.name || username}"`,
+      `git config user.email "${userData.email || `${username}@users.noreply.github.com`}"`,
+      `git add .`,
+      `git commit -m "Initialize Pydroid 3 Web Android APK build"`,
+      `git remote add origin "https://x-access-token:${cleanToken}@github.com/${username}/${cleanRepoName}.git"`,
+      `git push -u origin main --force`,
+    ].join(' && ');
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('bash', ['-c', commands]);
+      let errBuf = '';
+      proc.stderr.on('data', (d) => { errBuf += d.toString(); });
+      proc.on('close', (code) => {
+        try { fs.rmSync(exportDir, { recursive: true, force: true }); } catch (_) {}
+        if (code === 0) {
+          resolve();
+        } else {
+          const safeErr = errBuf.split(cleanToken).join('***');
+          if (safeErr.includes('without `workflow` scope') || safeErr.includes('workflow scope') || safeErr.includes('without workflow scope')) {
+            reject(
+              new Error(
+                'GitHub từ chối vì Token của bạn thiếu quyền "workflow". Vui lòng bấm vào liên kết "Lấy Token (đã chọn repo + workflow)" để tạo token mới có cả 2 quyền: repo VÀ workflow, sau đó dán lại vào ô bên dưới!'
+              )
+            );
+          } else {
+            reject(new Error(safeErr || 'Lỗi khi đẩy mã nguồn lên GitHub'));
+          }
+        }
+      });
+    });
+
+    return res.json({
+      success: true,
+      repoUrl: `https://github.com/${username}/${cleanRepoName}`,
+      actionsUrl: `https://github.com/${username}/${cleanRepoName}/actions`,
+      message: `Đã đẩy toàn bộ mã nguồn lên repository ${username}/${cleanRepoName} thành công! GitHub Actions đang tự động tạo file APK.`,
+    });
+  } catch (err: any) {
+    console.error('GitHub Push error:', err);
+    return res.status(500).json({ error: err.message || 'Lỗi hệ thống khi đẩy mã lên GitHub' });
+  }
+});
+
 // Serve local Pyodide WebAssembly package statically with correct MIME types and CORS
 const pyodidePath = path.join(process.cwd(), 'node_modules/pyodide');
+const publicPyodidePath = path.join(process.cwd(), 'public/pyodide');
+const activePyodideDir = fs.existsSync(pyodidePath) ? pyodidePath : (fs.existsSync(publicPyodidePath) ? publicPyodidePath : null);
 
-// Background check to ensure essential micropip and packaging wheels exist in node_modules/pyodide
-async function ensureEssentialPyodideWheels() {
-  if (!fs.existsSync(pyodidePath)) return;
-  const wheels = [
-    { name: 'micropip-0.6.0-py3-none-any.whl', url: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/micropip-0.6.0-py3-none-any.whl' },
-    { name: 'packaging-23.2-py3-none-any.whl', url: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/packaging-23.2-py3-none-any.whl' },
-  ];
-  for (const w of wheels) {
-    const dest = path.join(pyodidePath, w.name);
-    if (!fs.existsSync(dest)) {
-      try {
-        const resp = await fetch(w.url);
-        if (resp.ok) {
-          const buf = Buffer.from(await resp.arrayBuffer());
-          fs.writeFileSync(dest, buf);
-        }
-      } catch (_) {}
-    }
-  }
-}
-ensureEssentialPyodideWheels().catch(() => {});
-
-if (fs.existsSync(pyodidePath)) {
+if (activePyodideDir) {
   app.use('/pyodide', (req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     next();
-  }, express.static(pyodidePath, {
+  }, express.static(activePyodideDir, {
     maxAge: '1y',
     setHeaders: (res, filePath) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', '*');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       if (filePath.endsWith('.wasm')) {
         res.setHeader('Content-Type', 'application/wasm');
@@ -305,52 +418,50 @@ if (fs.existsSync(pyodidePath)) {
         res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
       } else if (filePath.endsWith('.zip')) {
         res.setHeader('Content-Type', 'application/zip');
-      } else if (filePath.endsWith('.whl')) {
-        res.setHeader('Content-Type', 'application/octet-stream');
       } else if (filePath.endsWith('.json')) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
       }
     },
   }));
 
-  // Fallback for any wheel or package not found locally in node_modules/pyodide:
-  // Redirect to jsDelivr CDN instead of letting SPA catch-all serve index.html!
-  app.get('/pyodide/:file', (req, res) => {
-    const filename = req.params.file;
-    return res.redirect(302, `https://cdn.jsdelivr.net/pyodide/v0.26.4/full/${encodeURIComponent(filename)}`);
+  // Fallback for wheels and assets not bundled locally (e.g. numpy, scipy, pandas, matplotlib)
+  // Redirect seamlessly to the official jsDelivr Pyodide CDN with full CORS support
+  app.get('/pyodide/*', (req, res) => {
+    const requestedFile = (req.params as any)[0];
+    if (requestedFile) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.redirect(302, `https://cdn.jsdelivr.net/pyodide/v0.26.4/full/${requestedFile}`);
+    }
+    return res.status(404).send('File not found');
   });
 }
 
-function getKeyPrefixCategory(key: string): 'AIza' | 'AQ.' | 'OTHER' | 'NONE' {
-  const s = (key || '').replace(/[\s\u200B-\u200D\uFEFF'"]+/g, '');
-  if (!s) return 'NONE';
-  if (s.startsWith('AIza')) return 'AIza';
-  if (s.startsWith('AQ.')) return 'AQ.';
-  return 'OTHER';
-}
-
-function isValidGeminiKeyFormat(key: string): boolean {
-  if (!key) return false;
-  const s = key.replace(/[\s\u200B-\u200D\uFEFF'"]+/g, '');
-  if (s.includes('...') || s.includes('MY_GEMINI') || s.includes('YOUR_API')) {
-    return false;
+// Load linked Firebase / Gemini Cloud Project metadata
+const connectedGeminiProject = {
+  projectId: process.env.GOOGLE_CLOUD_PROJECT || 'gen-lang-client-0593049002',
+  projectNumber: '591209272290',
+};
+try {
+  const fbCfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+  if (fs.existsSync(fbCfgPath)) {
+    const fbCfg = JSON.parse(fs.readFileSync(fbCfgPath, 'utf-8'));
+    if (fbCfg?.projectId) connectedGeminiProject.projectId = fbCfg.projectId;
+    if (fbCfg?.messagingSenderId) connectedGeminiProject.projectNumber = fbCfg.messagingSenderId;
   }
-  return /^[A-Za-z0-9_.-]{20,}$/.test(s);
+} catch (_) {}
+
+function getCleanServerGeminiKey(): string {
+  return (process.env.GEMINI_API_KEY || '')
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim();
 }
 
-// Initialize Gemini API dynamically so updated environment variables are always honored
-function getServerEnvGeminiKey(): string {
-  const raw = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').replace(
-    /[\s\u200B-\u200D\uFEFF'"]+/g,
-    ''
-  );
-  return isValidGeminiKeyFormat(raw) ? raw : '';
-}
-
-let cachedClientKey = getServerEnvGeminiKey();
-let preferredApiVersion: 'v1' | 'v1beta' | undefined = undefined;
-let ai = new GoogleGenAI({
-  apiKey: cachedClientKey || undefined,
+// Initialize Gemini API
+const ai = new GoogleGenAI({
+  apiKey: getCleanServerGeminiKey() || undefined,
   httpOptions: {
     headers: {
       'User-Agent': 'aistudio-build',
@@ -358,41 +469,165 @@ let ai = new GoogleGenAI({
   },
 });
 
-function createServerGenAiClient(apiKey: string, apiVersion?: 'v1' | 'v1beta'): GoogleGenAI {
-  return new GoogleGenAI({
-    apiKey: apiKey || undefined,
-    apiVersion,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
+// Setup WebSocket server for Python execution and Gemini Live API
+const wss = new WebSocketServer({ noServer: true });
+const liveWss = new WebSocketServer({ noServer: true });
 
-function getActiveAiInstance(): { client: GoogleGenAI; key: string } {
-  const currentKey = getServerEnvGeminiKey();
-  if (currentKey !== cachedClientKey) {
-    cachedClientKey = currentKey;
-    preferredApiVersion = undefined;
-    ai = createServerGenAiClient(cachedClientKey);
+liveWss.on('connection', async (ws: WebSocket) => {
+  console.log('[Gemini Live WS] Client connected for server-side Live API session');
+
+  let liveSession: any = null;
+  let liveSessionReady = false;
+
+  try {
+    if (process.env.GEMINI_API_KEY && typeof ai.live?.connect === 'function') {
+      try {
+        liveSession = await ai.live.connect({
+          model: 'gemini-3.8-live',
+          config: {
+            responseModalities: [Modality.AUDIO],
+            outputAudioTranscription: {},
+            systemInstruction: 'Bạn là Trợ lý AI Lập trình Python qua Live API trên Pydroid 3.',
+          },
+          callbacks: {
+            onopen: () => {
+              liveSessionReady = true;
+            },
+            onmessage: (message: LiveServerMessage) => {
+              if (ws.readyState !== ws.OPEN) return;
+              const serverContent = message.serverContent;
+              if (!serverContent) return;
+
+              if (serverContent.outputTranscription?.text) {
+                ws.send(JSON.stringify({ type: 'chunk', text: serverContent.outputTranscription.text }));
+              }
+
+              for (const part of serverContent.modelTurn?.parts ?? []) {
+                if (part.text) {
+                  ws.send(JSON.stringify({ type: 'chunk', text: part.text }));
+                }
+                if (part.inlineData?.data) {
+                  ws.send(JSON.stringify({ type: 'audio', audio: part.inlineData.data }));
+                }
+              }
+
+              ws.send(JSON.stringify({ type: 'content', data: serverContent }));
+
+              if (serverContent.interrupted) {
+                ws.send(JSON.stringify({ type: 'interrupted', interrupted: true }));
+              }
+              if (serverContent.turnComplete) {
+                ws.send(JSON.stringify({ type: 'done' }));
+              }
+            },
+            onerror: (err: any) => {
+              liveSessionReady = false;
+              if (ws.readyState === ws.OPEN) {
+                ws.send(JSON.stringify({ type: 'error', error: err?.message || String(err) }));
+              }
+            },
+            onclose: () => {
+              liveSessionReady = false;
+              if (ws.readyState === ws.OPEN) {
+                ws.send(JSON.stringify({ type: 'close' }));
+              }
+            },
+          },
+        });
+        liveSessionReady = true;
+      } catch (connErr: any) {
+        liveSession = null;
+        liveSessionReady = false;
+        console.warn('[Gemini Live WS] Live connect fallback mode:', connErr.message);
+      }
+    }
+  } catch (err: any) {
+    liveSession = null;
+    liveSessionReady = false;
+    console.warn('[Gemini Live WS] Init error:', err.message);
   }
-  return { client: ai, key: currentKey };
-}
 
-// Setup WebSocket servers: Python Execution and Live AI Session
-const pythonWss = new WebSocketServer({ noServer: true });
-const liveAiWss = new WebSocketServer({ noServer: true });
+  ws.on('message', async (data: any) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        return;
+      }
+
+      if (liveSession && liveSessionReady && typeof liveSession.sendRealtimeInput === 'function') {
+        if (msg.audio) {
+          liveSession.sendRealtimeInput({
+            audio: { data: msg.audio, mimeType: msg.mimeType || 'audio/pcm;rate=16000' },
+          });
+          return;
+        }
+        if (msg.video) {
+          liveSession.sendRealtimeInput({
+            video: { data: msg.video, mimeType: msg.mimeType || 'image/jpeg' },
+          });
+          return;
+        }
+        const liveText = msg.text || msg.prompt || (typeof msg === 'string' ? msg : '');
+        if (liveText) {
+          liveSession.sendRealtimeInput({ text: liveText });
+          return;
+        }
+      }
+
+      // High-compatibility server-side live fallback using streaming
+      const userText = msg.text || msg.prompt || (typeof msg === 'string' ? msg : '');
+      if (userText) {
+        let streamed = false;
+        for (const fallbackModel of CANDIDATE_MODELS) {
+          try {
+            const stream = await ai.models.generateContentStream({
+              model: fallbackModel,
+              contents: userText,
+              config: {
+                systemInstruction: 'Bạn là Trợ lý AI Lập trình Python qua Live API trên Pydroid 3.',
+              },
+            });
+            for await (const chunk of stream) {
+              if (ws.readyState === ws.OPEN && chunk.text) {
+                ws.send(JSON.stringify({ type: 'chunk', text: chunk.text }));
+                streamed = true;
+              }
+            }
+            if (streamed) break;
+          } catch (_) {
+            continue;
+          }
+        }
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'done' }));
+        }
+      }
+    } catch (msgErr: any) {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', error: msgErr.message }));
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    liveSessionReady = false;
+    if (liveSession && typeof liveSession.close === 'function') {
+      try {
+        liveSession.close();
+      } catch (_) {}
+    }
+  });
+});
 
 server.on('upgrade', (request, socket, head) => {
-  const urlStr = request.url || '';
-  if (urlStr.includes('/api/python/ws')) {
-    pythonWss.handleUpgrade(request, socket, head, (ws) => {
-      pythonWss.emit('connection', ws, request);
+  if (request.url && request.url.includes('/api/python/ws')) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
     });
-  } else if (urlStr.includes('/api/ai/live')) {
-    liveAiWss.handleUpgrade(request, socket, head, (ws) => {
-      liveAiWss.emit('connection', ws, request);
+  } else if (request.url && request.url.includes('/api/ai/live/ws')) {
+    liveWss.handleUpgrade(request, socket, head, (ws) => {
+      liveWss.emit('connection', ws, request);
     });
   } else {
     socket.destroy();
@@ -413,13 +648,11 @@ interface PythonSession {
 const activeSessions = new Map<string, PythonSession>();
 
 // REST endpoints for reliable HTTP-based Real-time Execution
-app.post('/api/python/session/start', async (req, res) => {
+app.post('/api/python/session/start', (req, res) => {
   const { code, stdin = '' } = req.body;
   if (typeof code !== 'string') {
     return res.status(400).json({ error: 'Mã nguồn không hợp lệ' });
   }
-
-  await ensureImportedModulesReady(code);
 
   const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const tempId = `pydroid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.py`;
@@ -432,7 +665,12 @@ app.post('/api/python/session/start', async (req, res) => {
     const py = spawn('python3', ['-u', tempFilePath], {
       env: {
         ...process.env,
-        PYTHONPATH: process.env.PYTHONPATH || PYDROID_PACKAGES_DIR,
+        PYTHONPATH: [
+          PYDROID_PACKAGES_DIR,
+          process.env.PYTHONPATH || '',
+          '/usr/local/lib/python3.10/dist-packages',
+          '/usr/lib/python3/dist-packages',
+        ].filter(Boolean).join(':'),
         PYTHONUNBUFFERED: '1',
         PYTHONDONTWRITEBYTECODE: '1',
         LC_ALL: 'en_US.UTF-8',
@@ -592,7 +830,7 @@ app.post('/api/python/session/:sessionId/stop', (req, res) => {
 });
 
 // Track active Python process per WS connection
-pythonWss.on('connection', (ws: WebSocket) => {
+wss.on('connection', (ws: WebSocket) => {
   let pyProcess: ChildProcessWithoutNullStreams | null = null;
   let tempFilePath: string | null = null;
   const startTime = Date.now();
@@ -616,7 +854,7 @@ pythonWss.on('connection', (ws: WebSocket) => {
     }
   };
 
-  ws.on('message', async (messageRaw) => {
+  ws.on('message', (messageRaw) => {
     try {
       const msg = JSON.parse(messageRaw.toString());
 
@@ -625,8 +863,6 @@ pythonWss.on('connection', (ws: WebSocket) => {
 
         const code = msg.code || '';
         const initialStdin = msg.stdin || '';
-
-        await ensureImportedModulesReady(code);
 
         // Write code to a secure temporary file
         const tempId = `pydroid_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.py`;
@@ -638,7 +874,12 @@ pythonWss.on('connection', (ws: WebSocket) => {
         pyProcess = spawn('python3', ['-u', tempFilePath], {
           env: {
             ...process.env,
-            PYTHONPATH: process.env.PYTHONPATH || PYDROID_PACKAGES_DIR,
+            PYTHONPATH: [
+              PYDROID_PACKAGES_DIR,
+              process.env.PYTHONPATH || '',
+              '/usr/local/lib/python3.10/dist-packages',
+              '/usr/lib/python3/dist-packages',
+            ].filter(Boolean).join(':'),
             PYTHONUNBUFFERED: '1',
             PYTHONDONTWRITEBYTECODE: '1',
             LC_ALL: 'en_US.UTF-8',
@@ -731,103 +972,12 @@ pythonWss.on('connection', (ws: WebSocket) => {
   });
 });
 
-// Live API WebSocket connection for real-time bidirectional audio & text (gemini-3.8-live)
-liveAiWss.on('connection', async (ws: WebSocket) => {
-  const { client: liveAi, key: activeLiveKey } = getActiveAiInstance();
-  if (!activeLiveKey) {
-    ws.send(JSON.stringify({ error: 'Máy chủ chưa được cấu hình GEMINI_API_KEY hợp lệ trong AI Studio Secrets hoặc Render Environment.' }));
-    ws.close();
-    return;
-  }
-
-  let session: any = null;
-  let isClosed = false;
-
-  try {
-    session = await liveAi.live.connect({
-      model: 'gemini-3.8-live',
-      callbacks: {
-        onopen: () => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'connected', message: 'Kết nối Live API thành công' }));
-          }
-        },
-        onmessage: (e: any) => {
-          if (!isClosed && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(e));
-          }
-        },
-        onerror: (err: any) => {
-          if (!isClosed && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ error: err?.message || 'Lỗi Live API' }));
-          }
-        },
-        onclose: () => {
-          if (!isClosed && ws.readyState === WebSocket.OPEN) {
-            ws.close();
-          }
-        },
-      },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: 'Puck',
-            },
-          },
-        },
-        systemInstruction: {
-          parts: [
-            {
-              text: 'Bạn là Trợ lý AI Lập trình Python thông minh trên Pydroid 3 Web. Hỗ trợ người dùng qua giọng nói và văn bản thời gian thực bằng tiếng Việt thân thiện, súc tích và chuẩn xác.',
-            },
-          ],
-        },
-      },
-    });
-
-    ws.on('message', async (raw) => {
-      try {
-        const payload = JSON.parse(raw.toString());
-        if (session && !isClosed) {
-          await session.send(payload);
-        }
-      } catch (err: any) {
-        console.log('[Live API] Gói tin từ client:', err?.message);
-      }
-    });
-
-    ws.on('close', () => {
-      isClosed = true;
-      if (session) {
-        try { session.close(); } catch (_) {}
-      }
-    });
-
-    ws.on('error', () => {
-      isClosed = true;
-      if (session) {
-        try { session.close(); } catch (_) {}
-      }
-    });
-  } catch (connectErr: any) {
-    console.log('[Live API] Thông báo kết nối Live API:', connectErr?.message || connectErr);
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ error: `Không thể kết nối Live API: ${connectErr?.message || 'Lỗi kết nối'}` }));
-      ws.close();
-    }
-  }
-});
-
 // REST endpoint: Direct run (fallback or non-websocket run)
 app.post('/api/python/run', async (req, res) => {
   const { code, stdin = '' } = req.body;
   if (typeof code !== 'string') {
     return res.status(400).json({ error: 'Mã nguồn Python không hợp lệ' });
   }
-
-  await ensureImportedModulesReady(code);
 
   const tempId = `pydroid_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.py`;
   const tempFilePath = path.join(os.tmpdir(), tempId);
@@ -839,7 +989,6 @@ app.post('/api/python/run', async (req, res) => {
     const py = spawn('python3', ['-u', tempFilePath], {
       env: {
         ...process.env,
-        PYTHONPATH: process.env.PYTHONPATH || PYDROID_PACKAGES_DIR,
         PYTHONUNBUFFERED: '1',
         PYTHONDONTWRITEBYTECODE: '1',
       },
@@ -888,239 +1037,6 @@ app.post('/api/python/run', async (req, res) => {
         // ignore
       }
       res.status(500).json({ error: err.message, stdout, stderr });
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// REST endpoint: Direct download a single Python file (.py) with Content-Disposition attachment for mobile & web
-app.get('/api/project/download-file', (req, res) => {
-  const name = (req.query.name as string) || 'main.py';
-  const cleanName = (name.endsWith('.py') ? name : `${name}.py`).replace(/[^a-zA-Z0-9._\-]/g, '_');
-  const content = (req.query.content as string) || '';
-
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename="${cleanName}"`);
-  res.setHeader('Content-Length', Buffer.byteLength(content, 'utf-8'));
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.send(content);
-});
-
-app.post('/api/project/download-file', (req, res) => {
-  const { name = 'main.py', content = '' } = req.body;
-  const cleanName = (name.endsWith('.py') ? name : `${name}.py`).replace(/[^a-zA-Z0-9._\-]/g, '_');
-
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename="${cleanName}"`);
-  res.setHeader('Content-Length', Buffer.byteLength(content, 'utf-8'));
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.send(content);
-});
-
-const LATEST_UPDATED_FILES = [
-  'src/utils/apiConfig.ts',
-  'src/utils/googleAuth.ts',
-  'src/utils/linter.ts',
-  'src/components/SettingsModal.tsx',
-  'src/components/ExportApkModal.tsx',
-  'src/components/ApkOAuthBridge.tsx',
-  'src/components/Editor.tsx',
-  'src/components/Terminal.tsx',
-  'src/components/AiAssistantModal.tsx',
-  'src/App.tsx',
-  'src/main.tsx',
-  'index.html',
-  'server.ts',
-  'firebase-applet-config.json',
-  'capacitor.config.json',
-  '.github/workflows/build-apk.yml',
-];
-
-const CORE_UPDATE_ROOT_FILES = new Set([
-  '.github/workflows/build-apk.yml',
-  'capacitor.config.json',
-  'firebase-applet-config.json',
-  'index.html',
-  'metadata.json',
-  'package.json',
-  'public/manifest.json',
-  'server.ts',
-  'tsconfig.json',
-  'vite.config.ts',
-  '.env.example',
-]);
-
-function collectProjectExportFiles(mode: 'full' | 'update' | 'latest'): string[] {
-  const rootDir = process.cwd();
-  const excludedDirs = new Set([
-    'node_modules',
-    'dist',
-    '.pydroid_packages',
-    'tmp',
-    '.git',
-    '__pycache__',
-  ]);
-
-  if (mode === 'latest') {
-    const selected = new Set<string>();
-    for (const rel of LATEST_UPDATED_FILES) {
-      const abs = path.join(rootDir, rel);
-      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-        selected.add(rel);
-      }
-    }
-    return Array.from(selected).sort();
-  }
-
-  const results: string[] = [];
-  const walk = (dir: string) => {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (excludedDirs.has(entry.name)) continue;
-        const relDir = path.relative(rootDir, path.join(dir, entry.name)).replace(/\\/g, '/');
-        if (
-          mode === 'update' &&
-          (relDir === 'resources' ||
-            relDir.startsWith('resources/') ||
-            relDir === 'public/assets' ||
-            relDir.startsWith('public/assets/') ||
-            relDir === 'src/assets' ||
-            relDir.startsWith('src/assets/'))
-        ) {
-          continue;
-        }
-        walk(path.join(dir, entry.name));
-      } else if (entry.isFile()) {
-        const fullPath = path.join(dir, entry.name);
-        const relPath = path.relative(rootDir, fullPath).replace(/\\/g, '/');
-        if (
-          entry.name.endsWith('.pyc') ||
-          entry.name.endsWith('.log') ||
-          entry.name.endsWith('.tmp') ||
-          entry.name === 'bun.lock' ||
-          entry.name.startsWith('test_pyodide_input')
-        ) {
-          continue;
-        }
-        if (mode === 'update') {
-          const isSrcCode =
-            relPath.startsWith('src/') &&
-            !relPath.startsWith('src/assets/') &&
-            !/\.(png|jpg|jpeg|gif|webp|ico)$/i.test(entry.name);
-          if (isSrcCode || CORE_UPDATE_ROOT_FILES.has(relPath)) {
-            results.push(relPath);
-          }
-        } else {
-          results.push(relPath);
-        }
-      }
-    }
-  };
-
-  walk(rootDir);
-  return results.sort();
-}
-
-// REST endpoint: Preview export file lists & sizes for Full vs Update packages
-app.get('/api/project/export-info', (req, res) => {
-  try {
-    const rootDir = process.cwd();
-    const latestFiles = collectProjectExportFiles('latest');
-    const updateFiles = collectProjectExportFiles('update');
-    const calcRawBytes = (files: string[]) =>
-      files.reduce((sum, rel) => {
-        try {
-          return sum + fs.statSync(path.join(rootDir, rel)).size;
-        } catch (_) {
-          return sum;
-        }
-      }, 0);
-
-    res.json({
-      success: true,
-      latestCount: latestFiles.length,
-      latestFiles,
-      latestRawKb: Math.max(1, Math.round(calcRawBytes(latestFiles) / 1024)),
-      updateCount: updateFiles.length,
-      updateFiles,
-      updateRawKb: Math.max(1, Math.round(calcRawBytes(updateFiles) / 1024)),
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Không thể đọc danh sách tệp' });
-  }
-});
-
-// REST endpoint: Export source code as a ZIP archive (supports mode=full | update | latest)
-app.get('/api/project/export-zip', (req, res) => {
-  const rawMode = String(req.query.mode || 'full').toLowerCase();
-  const mode: 'full' | 'update' | 'latest' =
-    rawMode === 'latest' ? 'latest' : rawMode === 'update' ? 'update' : 'full';
-  const downloadFilename =
-    mode === 'latest'
-      ? 'pydroid3-latest-patch.zip'
-      : mode === 'update'
-      ? 'pydroid3-update-files.zip'
-      : 'pydroid3-source-code.zip';
-
-  const zipPath = path.join(os.tmpdir(), `pydroid3_${mode}_${Date.now()}.zip`);
-  const rootDir = process.cwd();
-  const filesToArchive = collectProjectExportFiles(mode);
-
-  const pythonZipScript = `
-import os, json, sys, zipfile
-
-dest_zip = sys.argv[1]
-root_dir = sys.argv[2]
-files = json.loads(sys.stdin.read())
-
-with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED) as z:
-    for rel_path in files:
-        full_path = os.path.join(root_dir, rel_path)
-        if os.path.isfile(full_path):
-            z.write(full_path, rel_path)
-`;
-
-  try {
-    const py = spawn('python3', ['-c', pythonZipScript, zipPath, rootDir]);
-    py.stdin.write(JSON.stringify(filesToArchive));
-    py.stdin.end();
-
-    py.on('close', (code) => {
-      if (code === 0 && fs.existsSync(zipPath)) {
-        const fileStat = fs.statSync(zipPath);
-
-        // Support JSON base64 format for 100% reliable download inside iframes and Android browsers
-        if (req.query.format === 'base64') {
-          const fileBuf = fs.readFileSync(zipPath);
-          try { fs.unlinkSync(zipPath); } catch (_) {}
-          return res.json({
-            success: true,
-            mode,
-            filename: downloadFilename,
-            fileCount: filesToArchive.length,
-            files: filesToArchive,
-            size: fileStat.size,
-            base64: fileBuf.toString('base64'),
-          });
-        }
-
-        res.setHeader('Content-Type', 'application/zip');
-        res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
-        res.setHeader('Content-Length', fileStat.size);
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        const stream = fs.createReadStream(zipPath);
-        stream.pipe(res);
-        stream.on('end', () => {
-          try { fs.unlinkSync(zipPath); } catch (_) {}
-        });
-      } else {
-        res.status(500).json({ error: 'Không thể tạo file zip mã nguồn' });
-      }
-    });
-    py.on('error', (err) => {
-      res.status(500).json({ error: err.message });
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1252,22 +1168,6 @@ except Exception as e:
   py.on('error', () => {
     clearTimeout(timer);
     res.json({ valid: true, errors: [] });
-  });
-});
-
-// REST endpoint: System & AI Gateway Health Check for Android APK & Web
-app.get('/api/system/status', (req, res) => {
-  res.json({
-    status: 'ok',
-    server: 'Pydroid 3 Cloud Backend',
-    uptime: Math.round(process.uptime()),
-    timestamp: Date.now(),
-    features: {
-      geminiAi: Boolean(getServerEnvGeminiKey()),
-      cpythonNative: true,
-      websocketStreaming: true,
-      apkApiGateway: true,
-    },
   });
 });
 
@@ -1410,8 +1310,7 @@ function ensurePipReady(autoBootstrap = false): Promise<boolean> {
 
 // REST endpoint: List installed Python packages (combining system pip list and persistent workspace packages)
 app.get('/api/python/packages', async (req, res) => {
-  await ensurePipReady(true);
-
+  ensureEssentialPackageFixes();
   const persisted = loadPersistedPackages();
 
   const py = spawn('python3', ['-m', 'pip', 'list', '--format=json'], {
@@ -1430,7 +1329,7 @@ app.get('/api/python/packages', async (req, res) => {
   const timer = setTimeout(() => {
     try { py.kill(); } catch (_) {}
     res.json({ success: true, packages: persisted });
-  }, 10000);
+  }, 2500);
 
   py.on('close', (code) => {
     clearTimeout(timer);
@@ -1654,7 +1553,7 @@ app.post('/api/python/packages/uninstall', (req, res) => {
       }
     }
   } catch (e) {
-    console.log('Notice deleting package files from .pydroid_packages:', e);
+    console.warn('Error deleting package files from .pydroid_packages:', e);
   }
 
   // 2. Remove from registry
@@ -1961,295 +1860,26 @@ function getFallbackLessons(topic: string, levelStr: string, existingTitles: str
 }
 
 // Timeout helper for Gemini calls with generous allowance for complex reasoning & JSON generation
-function withTimeout<T>(promise: Promise<T>, ms = 35000, timeoutMessage = 'Gemini API timeout'): Promise<T> {
-  let timer: NodeJS.Timeout | null = null;
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
+function withTimeout<T>(promise: Promise<T>, ms = 12000): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('Gemini API timeout')), ms)),
+  ]);
 }
 
-// Multi-model fallback chain using active Gemini models from gemini-api skill
-const CANDIDATE_MODELS = [
-  'gemini-4-hydrogen',
-  'gemini-3.1-flash-lite',
-];
-
-let cachedWorkingModel: string | null = null;
-
-function getOrderedCandidateModels(): string[] {
-  if (cachedWorkingModel && CANDIDATE_MODELS.includes(cachedWorkingModel)) {
-    return [cachedWorkingModel, ...CANDIDATE_MODELS.filter((m) => m !== cachedWorkingModel)];
-  }
-  return CANDIDATE_MODELS;
-}
-
-function supportsThinkingConfig(modelName: string): boolean {
-  return modelName.includes('gemini-4');
-}
-
-function isAuthOrPermissionError(err: any): boolean {
-  const msg = String(err?.message || err || '').toLowerCase();
-  const status = (err?.status as number) || (err?.statusCode as number);
-  return (
-    status === 401 ||
-    status === 403 ||
-    msg.includes('api_key_invalid') ||
-    msg.includes('api key not valid') ||
-    msg.includes('api key expired') ||
-    msg.includes('permission_denied') ||
-    msg.includes('unauthenticated')
-  );
-}
-
-function extractFriendlyGeminiError(err: any): { friendly: string; raw: string; code?: number } {
-  const raw = String(err?.message || err || '');
-  let code: number | undefined = (err?.status as number) || (err?.statusCode as number);
-
-  try {
-    const jsonMatch = raw.match(/\{[\s\S]*"error"[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      if (parsed?.error) {
-        if (parsed.error.code) code = parsed.error.code;
-        const msg = parsed.error.message || '';
-        const details = parsed.error.details || [];
-        const isInvalidKey = details.some((d: any) => d.reason === 'API_KEY_INVALID') || msg.includes('API key not valid');
-        if (isInvalidKey) {
-          return {
-            friendly: 'Máy chủ Gemini AI chưa có GEMINI_API_KEY hợp lệ từ bảng Settings > Secrets của dự án Google AI Studio.',
-            raw,
-            code: 400,
-          };
-        }
-        if (msg.includes('Quota exceeded') || msg.includes('RESOURCE_EXHAUSTED') || code === 429) {
-          return {
-            friendly: 'Dịch vụ Gemini API đang vượt hạn mức sử dụng tạm thời (Quota Exceeded). Vui lòng thử lại sau ít phút.',
-            raw,
-            code: 429,
-          };
-        }
-        if (code === 503 || msg.toLowerCase().includes('high demand') || parsed.error.status === 'UNAVAILABLE') {
-          return {
-            friendly: 'Máy chủ Google Gemini đang quá tải tạm thời (503 High Demand). Khóa API vẫn hợp lệ — vui lòng thử lại sau vài giây.',
-            raw,
-            code: 503,
-          };
-        }
-        if (msg.includes('not found') || code === 404) {
-          return {
-            friendly: `Mô hình AI chưa được hỗ trợ trên Project này: ${msg}`,
-            raw,
-            code: 404,
-          };
-        }
-        if (msg) {
-          return { friendly: `Lỗi từ Google: ${msg}`, raw, code };
-        }
-      }
-    }
-  } catch (_) {}
-
-  const lower = raw.toLowerCase();
-  if (lower.includes('api_key_invalid') || lower.includes('api key not valid') || lower.includes('unauthenticated')) {
-    return {
-      friendly: 'Máy chủ Gemini AI chưa có GEMINI_API_KEY hợp lệ từ bảng Settings > Secrets của dự án Google AI Studio.',
-      raw,
-      code: 401,
-    };
-  }
-  if (lower.includes('503') || lower.includes('unavailable') || lower.includes('high demand')) {
-    return {
-      friendly: 'Máy chủ Google Gemini đang quá tải tạm thời (503 High Demand). Khóa API vẫn hợp lệ — vui lòng thử lại sau vài giây.',
-      raw,
-      code: 503,
-    };
-  }
-  if (lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('rate limit') || lower.includes('429')) {
-    return {
-      friendly: 'Dịch vụ Gemini API đang vượt hạn mức sử dụng miễn phí (Quota Limit). Vui lòng thử lại sau ít phút.',
-      raw,
-      code: 429,
-    };
-  }
-  if (lower.includes('permission_denied') || lower.includes('403')) {
-    return {
-      friendly: 'Dịch vụ Gemini API bị từ chối quyền truy cập (Permission Denied). Hãy kiểm tra GEMINI_API_KEY và Generative Language API trong dự án.',
-      raw,
-      code: 403,
-    };
-  }
-  if (lower.includes('timeout') || lower.includes('etimedout') || lower.includes('deadline exceeded')) {
-    return {
-      friendly: 'Quá thời gian kết nối tới Google Gemini (Timeout). Vui lòng kiểm tra lại kết nối mạng.',
-      raw,
-      code: 504,
-    };
-  }
-  if (lower.includes('fetch failed') || lower.includes('network')) {
-    return {
-      friendly: 'Không thể kết nối đến máy chủ Google Gemini. Vui lòng kiểm tra kết nối mạng Internet của bạn.',
-      raw,
-      code: 0,
-    };
-  }
-
-  return {
-    friendly: raw || 'Không nhận được phản hồi từ mô hình',
-    raw,
-    code,
-  };
-}
-
-function getAiClient(_req?: express.Request): {
-  aiClient: GoogleGenAI;
-  hasKey: boolean;
-  isCustom: boolean;
-  hasServerKey: boolean;
-} {
-  const { client, key } = getActiveAiInstance();
-  const hasServerKey = isValidGeminiKeyFormat(key);
-  return {
-    aiClient: client,
-    hasKey: hasServerKey,
-    isCustom: false,
-    hasServerKey,
-  };
-}
-
-function getAiClientForRequest(req?: express.Request): {
-  aiClient: GoogleGenAI;
-  hasKey: boolean;
-  isCustom: boolean;
-  hasServerKey: boolean;
-} {
-  return getAiClient(req);
-}
-
-function classifyServerAiError(err: any): {
-  failureType: 'INVALID_KEY' | 'NETWORK_TIMEOUT' | 'SERVER_REJECTION' | 'UNKNOWN';
-  reason: string;
-  remediation: string;
-} {
-  const msg = String(err?.message || err || '');
-  const lower = msg.toLowerCase();
-  const status = (err?.status as number) || (err?.statusCode as number);
-
-  if (
-    status === 401 ||
-    lower.includes('api key not valid') ||
-    lower.includes('api_key_invalid') ||
-    lower.includes('unauthenticated') ||
-    lower.includes('invalid api key') ||
-    lower.includes('api key expired') ||
-    lower.includes('key is missing')
-  ) {
-    return {
-      failureType: 'INVALID_KEY',
-      reason: 'GEMINI_API_KEY của máy chủ chưa được thiết lập đúng hoặc đã bị thu hồi.',
-      remediation: 'Mở bảng Settings > Secrets của dự án Google AI Studio để chọn hoặc cập nhật GEMINI_API_KEY hợp lệ.',
-    };
-  }
-
-  if (
-    status === 408 ||
-    status === 504 ||
-    lower.includes('timeout') ||
-    lower.includes('timed out') ||
-    lower.includes('etimedout') ||
-    lower.includes('esockettimedout') ||
-    lower.includes('abort') ||
-    lower.includes('deadline exceeded')
-  ) {
-    return {
-      failureType: 'NETWORK_TIMEOUT',
-      reason: 'Quá thời gian chờ phản hồi từ Google Gemini API (Network Timeout).',
-      remediation: 'Kiểm tra kết nối mạng và độ trễ upstream. Hệ thống sẽ tự động thử lại với các mô hình dự phòng.',
-    };
-  }
-
-  if (
-    (status && status >= 400 && status !== 401) ||
-    lower.includes('resource_exhausted') ||
-    lower.includes('quota') ||
-    lower.includes('rate limit') ||
-    lower.includes('permission_denied') ||
-    lower.includes('500') ||
-    lower.includes('502') ||
-    lower.includes('503') ||
-    lower.includes('429') ||
-    lower.includes('403')
-  ) {
-    return {
-      failureType: 'SERVER_REJECTION',
-      reason: `Máy chủ Google Gemini từ chối yêu cầu (${status ? `HTTP ${status}` : 'Server Error'}).`,
-      remediation: 'Nếu là lỗi 429 (hết hạn mức), hãy thử lại sau ít phút hoặc dùng API Key thuộc Project khác.',
-    };
-  }
-
-  return {
-    failureType: 'UNKNOWN',
-    reason: `Lỗi phát sinh trong quá trình gọi AI: ${msg}`,
-    remediation: 'Kiểm tra chi tiết lỗi bên dưới để xử lý.',
-  };
-}
-
-function printTerminalAiDiagnostic(diag: {
-  timestamp?: string;
-  endpoint: string;
-  operation?: string;
-  failureType: string;
-  httpStatus?: number;
-  errorMessage: string;
-  keyValidation?: any;
-  remediation?: string;
-  source?: string;
-}) {
-  const ts = diag.timestamp || new Date().toISOString();
-  const sep = '='.repeat(78);
-  const colorCyan = '\x1b[36;1m';
-  const colorYellow = '\x1b[33;1m';
-  const colorReset = '\x1b[0m';
-
-  console.log(`\n${colorCyan}${sep}${colorReset}`);
-  console.log(`${colorCyan}[AI Diagnostic Info] (${diag.failureType}): ${diag.endpoint} [${diag.operation || 'AI Operation'}]${colorReset}`);
-  console.log(`Timestamp:      ${ts}`);
-  console.log(`Classification: ${colorYellow}[${diag.failureType}]${colorReset}`);
-  if (diag.httpStatus) {
-    console.log(`HTTP Status:    ${diag.httpStatus}`);
-  }
-  if (diag.keyValidation) {
-    console.log(`API Key Info:   Source: ${diag.keyValidation.source || 'N/A'}, Status: ${diag.keyValidation.status || 'N/A'}, Masked: ${diag.keyValidation.maskedKey || 'N/A'}, Length: ${diag.keyValidation.keyLength ?? 'N/A'}`);
-    if (diag.keyValidation.reason) {
-      console.log(`Key Issue:      ${diag.keyValidation.reason}`);
-    }
-  }
-  const cleanErrorMsg = typeof diag.errorMessage === 'string' && diag.errorMessage.includes('{')
-    ? (extractFriendlyGeminiError(diag.errorMessage).friendly || 'Dịch vụ Gemini đang tạm thời gián đoạn')
-    : String(diag.errorMessage || '');
-  console.log(`Diagnostic:     ${cleanErrorMsg}`);
-  if (diag.remediation) {
-    console.log(`${colorCyan}Remediation:    ${diag.remediation}${colorReset}`);
-  }
-  console.log(`${colorCyan}${sep}${colorReset}\n`);
-}
+// Multi-model fallback chain to handle rate limits, 503 spikes, and temporary unavailability seamlessly
+// Standard recommended models from official Gemini API guidelines
+const CANDIDATE_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
 
 async function callWithModelFallback<T>(
   fn: (modelName: string) => Promise<T>
 ): Promise<T> {
   let lastError: any = null;
-  for (const model of getOrderedCandidateModels()) {
+  for (const model of CANDIDATE_MODELS) {
     try {
-      const result = await fn(model);
-      cachedWorkingModel = model;
-      return result;
+      return await fn(model);
     } catch (err: any) {
       lastError = err;
-      if (isAuthOrPermissionError(err)) {
-        throw err;
-      }
       continue;
     }
   }
@@ -2595,11 +2225,8 @@ app.post('/api/ai/debug', async (req, res) => {
     return res.status(400).json({ error: 'Thiếu thông tin mã hoặc lỗi' });
   }
 
-  const { aiClient, hasKey, isCustom, hasServerKey } = getAiClient(req);
-
-  // 1. Try Gemini API with multi-model fallback & timeout (when key is present)
-  if (hasKey) {
-    try {
+  // 1. Try Gemini API with multi-model fallback & timeout
+  try {
     const prompt = `Bạn là Trình gỡ lỗi Python AI thông minh hàng đầu trên ứng dụng Pydroid 3 Android.
 Người dùng đang viết mã Python và gặp lỗi hoặc yêu cầu kiểm tra sửa lỗi sau:
 
@@ -2618,81 +2245,35 @@ Nhiệm vụ của bạn:
 
 Hãy trả về phản hồi ĐÚNG định dạng JSON theo schema đã cho.`;
 
-    const clientsToTry = isCustom && hasServerKey ? [aiClient, ai] : [aiClient];
-    let response: any = null;
-    let customError: any = null;
-    let lastClientErr: any = null;
-
-    for (const activeClient of clientsToTry) {
-      try {
-        response = await callWithModelFallback(async (modelName) => {
-          const baseConfig: any = {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                errorType: { type: Type.STRING },
-                vietnameseSummary: { type: Type.STRING },
-                rootCause: { type: Type.STRING },
-                tips: { type: Type.ARRAY, items: { type: Type.STRING } },
-                fixedCode: { type: Type.STRING },
-                diffExplanation: { type: Type.STRING },
-              },
-              required: ['errorType', 'vietnameseSummary', 'rootCause', 'tips', 'fixedCode', 'diffExplanation'],
+    const response = await callWithModelFallback(async (modelName) => {
+      return await withTimeout(ai.models.generateContent({
+        model: modelName,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              errorType: { type: Type.STRING },
+              vietnameseSummary: { type: Type.STRING },
+              rootCause: { type: Type.STRING },
+              tips: { type: Type.ARRAY, items: { type: Type.STRING } },
+              fixedCode: { type: Type.STRING },
+              diffExplanation: { type: Type.STRING },
             },
-          };
-          try {
-            const modelConfig = supportsThinkingConfig(modelName)
-              ? { ...baseConfig, thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : baseConfig;
-            return await withTimeout(
-              activeClient.models.generateContent({
-                model: modelName,
-                contents: prompt,
-                config: modelConfig,
-              }),
-              35000
-            );
-          } catch (err: any) {
-            const status = (err?.status as number) || (err?.statusCode as number);
-            if (status === 400 && supportsThinkingConfig(modelName) && !isAuthOrPermissionError(err)) {
-              return await withTimeout(
-                activeClient.models.generateContent({
-                  model: modelName,
-                  contents: prompt,
-                  config: baseConfig,
-                }),
-                35000
-              );
-            }
-            throw err;
-          }
-        });
-        if (response?.text) break;
-      } catch (clientErr: any) {
-        if (isCustom && activeClient === aiClient) customError = clientErr;
-        lastClientErr = clientErr;
-      }
-    }
-
-    if (!response) throw (customError || lastClientErr || new Error('Không nhận được phản hồi từ mô hình'));
+            required: ['errorType', 'vietnameseSummary', 'rootCause', 'tips', 'fixedCode', 'diffExplanation'],
+          },
+        },
+      }));
+    });
 
     const parsed = JSON.parse(response.text || '{}');
     if (parsed.errorType && parsed.fixedCode) {
       return res.json(parsed);
     }
   } catch (err: any) {
-    const diag = classifyServerAiError(err);
-    printTerminalAiDiagnostic({
-      endpoint: '/api/ai/debug',
-      operation: 'AI Debugger',
-      failureType: diag.failureType,
-      errorMessage: extractFriendlyGeminiError(err).friendly,
-      remediation: diag.remediation,
-    });
     console.log('[AI Debugger] Kích hoạt bộ phân tích lỗi dự phòng chuẩn PEP 8.');
   }
-}
 
   // 2. Intelligent Rule-Based Fallback Debugger (Guarantees zero-failure response)
   const localAnalysis = analyzeAndFixLocally(code, errorText);
@@ -2730,11 +2311,8 @@ app.post('/api/ai/generate-lessons', async (req, res) => {
   const cleanExistingTitles = Array.isArray(existingTitles) ? existingTitles.filter(Boolean) : [];
   const cleanCompletedTitles = Array.isArray(completedTitles) ? completedTitles.filter(Boolean) : [];
 
-  const { aiClient, hasKey, isCustom, hasServerKey } = getAiClient(req);
-
-  // 1. Try Gemini API with timeout (when key is available)
-  if (hasKey) {
-    try {
+  // 1. Try Gemini API with timeout
+  try {
     const prompt = `Bạn là Giảng viên Chuyên gia Lập trình Python cao cấp cho ứng dụng Pydroid 3 Web trên Android.
 Nhiệm vụ: Hãy tạo 2 đến 3 bài tập thực hành Python HOÀN TOÀN MỚI, SÁNG TẠO theo chủ đề: "${safeTopic}" và cấp độ: "${level}".
 
@@ -2769,15 +2347,13 @@ Mỗi bài tập cần có:
 
 Hãy xuất kết quả hoàn toàn bằng tiếng Việt chuẩn theo định dạng JSON.`;
 
-    const clientsToTry = isCustom && hasServerKey ? [aiClient, ai] : [aiClient];
-    let response: any = null;
-    let customError: any = null;
-    let lastClientErr: any = null;
-
-    for (const activeClient of clientsToTry) {
-      try {
-        response = await callWithModelFallback(async (modelName) => {
-          const baseConfig: any = {
+    const response = await callWithModelFallback(async (modelName) => {
+      return await withTimeout(
+        ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -2803,42 +2379,11 @@ Hãy xuất kết quả hoàn toàn bằng tiếng Việt chuẩn theo định d
               },
               required: ['lessons'],
             },
-          };
-          try {
-            const modelConfig = supportsThinkingConfig(modelName)
-              ? { ...baseConfig, thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : baseConfig;
-            return await withTimeout(
-              activeClient.models.generateContent({
-                model: modelName,
-                contents: prompt,
-                config: modelConfig,
-              }),
-              45000
-            );
-          } catch (err: any) {
-            const status = (err?.status as number) || (err?.statusCode as number);
-            if (status === 400 && supportsThinkingConfig(modelName) && !isAuthOrPermissionError(err)) {
-              return await withTimeout(
-                activeClient.models.generateContent({
-                  model: modelName,
-                  contents: prompt,
-                  config: baseConfig,
-                }),
-                45000
-              );
-            }
-            throw err;
-          }
-        });
-        if (response?.text) break;
-      } catch (clientErr: any) {
-        if (isCustom && activeClient === aiClient) customError = clientErr;
-        lastClientErr = clientErr;
-      }
-    }
-
-    if (!response) throw (customError || lastClientErr || new Error('Không nhận được phản hồi từ mô hình'));
+          },
+        }),
+        18000
+      );
+    });
 
     const parsed = JSON.parse(response.text || '{"lessons":[]}');
     if (parsed.lessons && Array.isArray(parsed.lessons) && parsed.lessons.length > 0) {
@@ -2847,39 +2392,62 @@ Hãy xuất kết quả hoàn toàn bằng tiếng Việt chuẩn theo định d
       return res.json({ lessons: sanitized });
     }
   } catch (err: any) {
-    const diag = classifyServerAiError(err);
-    printTerminalAiDiagnostic({
-      endpoint: '/api/ai/generate-lessons',
-      operation: 'Generate Lessons',
-      failureType: diag.failureType,
-      errorMessage: extractFriendlyGeminiError(err).friendly,
-      remediation: diag.remediation,
-    });
     console.log('[AI Lessons] Kích hoạt tạo kho bài học dự phòng chất lượng cao.');
   }
-}
 
   // 2. High-Quality Fallback Generation (Instantly returns custom lessons without failing!)
   const fallbackLessons = getFallbackLessons(safeTopic, level, cleanExistingTitles);
   res.json({ lessons: fallbackLessons });
 });
 
-// Helper to build chat prompt payload and system instructions
-function buildChatPayload(code: string, messages: any[], instruction: string, errorText: string) {
-  const codeLines = (code || '').split('\n');
-  const numberedCode = codeLines
-    .map((l: string, idx: number) => `${idx + 1}: ${l}`)
-    .join('\n');
+function extractCodeFromRequest(
+  code?: string,
+  prompt?: string,
+  messages?: Array<{ text?: string; content?: string }>
+): string {
+  if (code && code.trim()) return code;
+  const sources = [
+    prompt || '',
+    ...(Array.isArray(messages) ? messages.map((m) => m.text || m.content || '') : []),
+  ];
+  for (const src of sources) {
+    const editorMatch = src.match(/\[MÃ PYTHON HIỆN TẠI[^\]]*\]:\s*```(?:python)?\s*([\s\S]*?)```/i);
+    if (editorMatch && editorMatch[1] && editorMatch[1].trim()) {
+      return editorMatch[1].trim();
+    }
+  }
+  return '';
+}
 
-  const rawMessages = Array.isArray(messages) ? messages : [];
-  const lastUserMsg = [...rawMessages].reverse().find((m: any) => m && m.sender === 'user') || rawMessages[rawMessages.length - 1];
-  const rawUserText = String(lastUserMsg?.text || '').toLowerCase();
-  const isFixErrorRequest =
-    instruction === 'fix_error' ||
-    instruction === 'analyze_fix_clean' ||
-    /s[uư][aảã].*l[oô][iỉĩ]|l[oô][iỉĩ]|fix.*error|fix.*bug|debug|g[oỡ].*l[oô][iỉĩ]|b[iị].*l[oô][iỉĩ]|d[oò]ng.*m[aấ]y.*l[oô][iỉĩ]|s[uư][aảã].*code/i.test(rawUserText);
+function buildGreetingWithCodeSummary(effectiveCode: string): string {
+  const lineCount = effectiveCode.split('\n').length;
+  return `👋 **Chào bạn! Mình là Trợ lý AI Lập trình Python.**\n\nMình đang đọc trực tiếp mã nguồn của bạn trong khung soạn thảo (**${lineCount} dòng mã Python**).\n\nBạn muốn mình làm gì với đoạn mã hiện tại?\n- 🔍 Bấm **Giải thích** để xem phân tích chi tiết luồng chạy.\n- 🛠️ Bấm **Sửa lỗi code** hoặc **Lỗi dòng nào** để kiểm tra và sửa tự động.\n- ✨ Bấm **Tối ưu PEP 8** để chuẩn hóa sạch đẹp ngay lập tức.\n\n*(Hoặc nhập trực tiếp yêu cầu cụ thể cho **${lineCount} dòng code** này bên dưới!)*`;
+}
 
-  const systemInstruction = `Bạn là Trợ lý AI Lập trình Python thông minh, tận tâm và chuyên nghiệp trên ứng dụng Pydroid 3 Web cho Android.
+// REST endpoint: Gemini AI Python Coding Assistant Multi-turn Chat
+app.post('/api/ai/chat', async (req, res) => {
+  const { code = '', messages = [], instruction = '', errorText = '', prompt = '' } = req.body;
+  const effectiveCode = extractCodeFromRequest(code, prompt, messages);
+
+  try {
+    const formattedHistory = (Array.isArray(messages) ? messages : []).map((m: any) => ({
+      role: m.sender === 'user' ? 'user' : 'model',
+      parts: [{ text: m.text }],
+    }));
+
+    const codeLines = effectiveCode ? effectiveCode.split('\n') : [];
+    const numberedCode = codeLines
+      .map((l: string, idx: number) => `${idx + 1}: ${l}`)
+      .join('\n');
+
+    const lastUserMsg = messages[messages.length - 1];
+    const rawUserText = String(lastUserMsg?.text || prompt || '').toLowerCase();
+    const isFixErrorRequest =
+      instruction === 'fix_error' ||
+      instruction === 'analyze_fix_clean' ||
+      /s[uư][aảã].*l[oô][iỉĩ]|l[oô][iỉĩ]|fix.*error|fix.*bug|debug|g[oỡ].*l[oô][iỉĩ]|b[iị].*l[oô][iỉĩ]|d[oò]ng.*m[aấ]y.*l[oô][iỉĩ]|s[uư][aảã].*code/i.test(rawUserText);
+
+    const systemInstruction = `Bạn là Trợ lý AI Lập trình Python thông minh, tận tâm và chuyên nghiệp trên ứng dụng Pydroid 3 Web cho Android.
 Nhiệm vụ của bạn là hỗ trợ người dùng học, viết, phân tích, tối ưu và gỡ lỗi/sửa lỗi mã Python.
 
 Quy tắc quan trọng:
@@ -2899,781 +2467,590 @@ ${errorText ? `\n⚠️ Thông báo lỗi hoặc Traceback ghi nhận gần nh�
    - 💡 **Các điểm cải tiến:** Nêu ngắn gọn các điểm đã làm sạch và sửa chữa mã.
 7. Nếu người dùng mới mở chat (chưa có câu hỏi nào) hoặc yêu cầu giải thích ban đầu: Hãy tóm tắt nhanh mã nguồn hiện tại, nêu mục đích hoạt động, cấu trúc chính và gợi ý các hướng nâng cấp tiếp theo.`;
 
-  let userPrompt = '';
-  if (isFixErrorRequest) {
-    userPrompt = lastUserMsg?.text && lastUserMsg.text.length > 5
-      ? `${lastUserMsg.text}\n\n(Yêu cầu: Chỉ rõ dòng lỗi, nguyên nhân và cung cấp mã Python hoàn chỉnh ĐÃ SỬA LỖI 100% trong khối \`\`\`python ... \`\`\` để nạp vào Editor)`
-      : 'Hãy phân tích chi tiết lỗi trong mã nguồn hiện tại: chỉ rõ lỗi ở dòng nào (dòng số mấy), nguyên nhân gây lỗi là gì, và viết ra code mới đã sửa hoàn chỉnh 100% chạy đúng đắn theo chuẩn Python PEP 8.';
-  } else if (instruction === 'explain_source_code' || instruction === 'initial_explain') {
-    userPrompt = lastUserMsg?.text || 'Hãy giải thích chi tiết mã nguồn Python này, luồng thực thi và các điểm cần lưu ý.';
-  } else if (instruction === 'optimize_pep8') {
-    userPrompt = lastUserMsg?.text || 'Hãy tối ưu và chuẩn hóa toàn bộ mã nguồn Python này theo tiêu chuẩn PEP 8 chính thức: thụt lề 4 khoảng trắng, đặt tên biến/hàm theo snake_case rõ ràng, thêm type hints/docstring ngắn gọn, viết theo phong cách Pythonic gọn gàng, loại bỏ mã thừa. Cung cấp mã hoàn chỉnh trong khối ```python ... ``` để người dùng có thể bấm Áp dụng vào Editor ngay lập tức.';
-  } else if (instruction === 'explain_line_by_line') {
-    userPrompt = lastUserMsg?.text || 'Hãy giải thích chi tiết từng dòng trong đoạn mã Python hiện tại của mình một cách dễ hiểu nhất.';
-  } else if (instruction === 'pythonic') {
-    userPrompt = lastUserMsg?.text || 'Hãy viết lại đoạn mã này theo phong cách Pythonic ngắn gọn, tối ưu và đẹp mắt nhất chuẩn PEP 8.';
-  } else if (instruction === 'try_except') {
-    userPrompt = lastUserMsg?.text || 'Hãy bổ sung khối bắt lỗi ngoại lệ try...except cho các vị trí có nguy cơ xảy ra lỗi trong mã này.';
-  } else if (instruction === 'add_comments') {
-    userPrompt = lastUserMsg?.text || 'Hãy thêm các chú thích (comment) tiếng Việt chi tiết, rõ ràng vào từng phần quan trọng của đoạn mã này.';
-  } else if (instruction === 'test_data') {
-    userPrompt = lastUserMsg?.text || 'Hãy cho mình một số bộ ví dụ dữ liệu chạy thử (input và output mong đợi) kèm giải thích cho đoạn code này.';
-  } else {
-    userPrompt = lastUserMsg?.text || 'Hãy phân tích mã nguồn hiện tại của mình.';
-  }
-
-  // Clean and normalize multi-turn chat history for Gemini API:
-  // Rule 1: The first turn must always have role 'user' (drop any leading assistant greetings)
-  // Rule 2: Alternating roles (merge consecutive identical roles)
-  // Rule 3: The last turn is our enriched prompt with code context
-  const previousTurns = rawMessages.slice(0, -1);
-  const normalizedHistory: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
-
-  for (const item of previousTurns) {
-    if (!item || typeof item.text !== 'string' || !item.text.trim()) continue;
-    const role: 'user' | 'model' = item.sender === 'user' ? 'user' : 'model';
-    const text = item.text.trim();
-
-    // Discard leading assistant/model greeting turns before the first user turn
-    if (normalizedHistory.length === 0 && role === 'model') {
-      continue;
-    }
-
-    if (normalizedHistory.length > 0 && normalizedHistory[normalizedHistory.length - 1].role === role) {
-      normalizedHistory[normalizedHistory.length - 1].parts[0].text += `\n\n${text}`;
+    let userPrompt = '';
+    if (isFixErrorRequest) {
+      userPrompt = (prompt || (lastUserMsg?.text && lastUserMsg.text.length > 5 ? lastUserMsg.text : ''))
+        ? `${prompt || lastUserMsg?.text}\n\n(Yêu cầu: Chỉ rõ dòng lỗi, nguyên nhân và cung cấp mã Python hoàn chỉnh ĐÃ SỬA LỖI 100% trong khối \`\`\`python ... \`\`\` để nạp vào Editor)`
+        : 'Hãy phân tích chi tiết lỗi trong mã nguồn hiện tại: chỉ rõ lỗi ở dòng nào (dòng số mấy), nguyên nhân gây lỗi là gì, và viết ra code mới đã sửa hoàn chỉnh 100% chạy đúng đắn theo chuẩn Python PEP 8.';
+    } else if (instruction === 'explain_source_code' || instruction === 'initial_explain') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy giải thích chi tiết mã nguồn Python này, luồng thực thi và các điểm cần lưu ý.';
+    } else if (instruction === 'optimize_pep8') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy tối ưu và chuẩn hóa toàn bộ mã nguồn Python này theo tiêu chuẩn PEP 8 chính thức: thụt lề 4 khoảng trắng, đặt tên biến/hàm theo snake_case rõ ràng, thêm type hints/docstring ngắn gọn, viết theo phong cách Pythonic gọn gàng, loại bỏ mã thừa. Cung cấp mã hoàn chỉnh trong khối ```python ... ``` để người dùng có thể bấm Áp dụng vào Editor ngay lập tức.';
+    } else if (instruction === 'explain_line_by_line') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy giải thích chi tiết từng dòng trong đoạn mã Python hiện tại của mình một cách dễ hiểu nhất.';
+    } else if (instruction === 'pythonic') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy viết lại đoạn mã này theo phong cách Pythonic ngắn gọn, tối ưu và đẹp mắt nhất chuẩn PEP 8.';
+    } else if (instruction === 'try_except') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy bổ sung khối bắt lỗi ngoại lệ try...except cho các vị trí có nguy cơ xảy ra lỗi trong mã này.';
+    } else if (instruction === 'add_comments') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy thêm các chú thích (comment) tiếng Việt chi tiết, rõ ràng vào từng phần quan trọng của đoạn mã này.';
+    } else if (instruction === 'test_data') {
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy cho mình một số bộ ví dụ dữ liệu chạy thử (input và output mong đợi) kèm giải thích cho đoạn code này.';
     } else {
-      normalizedHistory.push({ role, parts: [{ text }] });
+      userPrompt = prompt || lastUserMsg?.text || 'Hãy phân tích mã nguồn hiện tại của mình.';
     }
-  }
 
-  // Ensure the preceding turn was 'model' so appending the new 'user' prompt alternates cleanly
-  while (normalizedHistory.length > 0 && normalizedHistory[normalizedHistory.length - 1].role === 'user') {
-    normalizedHistory.pop();
-  }
-
-  const finalUserTurn = {
-    role: 'user' as const,
-    parts: [
+    // Call Gemini with multi-model fallback & extended timeout (18s)
+    const historyTurns = formattedHistory.slice(0, -1);
+    const contents = [
+      ...historyTurns,
       {
-        text: `[Ngữ cảnh mã nguồn Python hiện tại trong Editor]:\n\`\`\`python\n${numberedCode || '# (Trống)'}\n\`\`\`\n${errorText ? `\n[Thông báo lỗi / Traceback gần nhất từ Terminal]:\n\`\`\`\n${errorText}\n\`\`\`\n` : ''}\n\n[Yêu cầu của người dùng]:\n${userPrompt}`,
+        role: 'user',
+        parts: [
+          {
+            text: `[Ngữ cảnh mã nguồn Python hiện tại trong Editor]:\n\`\`\`python\n${numberedCode || '# (Trống)'}\n\`\`\`\n${errorText ? `\n[Thông báo lỗi / Traceback gần nhất từ Terminal]:\n\`\`\`\n${errorText}\n\`\`\`\n` : ''}\n\n[Yêu cầu của người dùng]:\n${userPrompt}`,
+          },
+        ],
       },
-    ],
+    ];
+
+    const response = await callWithModelFallback(async (modelName) => {
+      return await withTimeout(
+        ai.models.generateContent({
+          model: modelName,
+          contents,
+          config: {
+            systemInstruction,
+          },
+        })
+      );
+    });
+
+    const replyText = response.text || 'Xin lỗi, mình chưa thể xử lý câu trả lời lúc này.';
+    return res.json({ reply: replyText });
+  } catch (err: any) {
+    console.log('[AI Chat] Kích hoạt phân tích thông minh dự phòng.');
+
+    // Guaranteed smart fallback in case of network timeout or quota limit
+    const lastUserMsg = messages[messages.length - 1];
+    const rawUserText = String(prompt || lastUserMsg?.text || '').trim();
+    const rawLower = rawUserText.toLowerCase();
+    const isErrorAnalysis =
+      instruction === 'fix_error' ||
+      instruction === 'analyze_fix_clean' ||
+      /s[uư][aảã].*l[oô][iỉĩ]|l[oô][iỉĩ]|fix.*error|fix.*bug|debug|g[oỡ].*l[oô][iỉĩ]|b[iị].*l[oô][iỉĩ]|d[oò]ng.*m[aấ]y.*l[oô][iỉĩ]|s[uư][aảã].*code/i.test(rawLower);
+
+    let fallbackReply = '';
+    if (instruction === 'fix_error' || instruction === 'analyze_fix_clean' || isErrorAnalysis) {
+      fallbackReply = analyzeAndFixLocally(effectiveCode, errorText);
+    } else if (instruction === 'explain_source_code' || instruction === 'initial_explain' || instruction === 'explain' || rawLower.includes('giải thích') || rawLower.includes('explain')) {
+      fallbackReply = generateExplainResponseLocally(effectiveCode);
+    } else if (instruction === 'optimize_pep8' || instruction === 'pep8' || rawLower.includes('pep8') || rawLower.includes('tối ưu')) {
+      fallbackReply = `⚡ **Mã nguồn đã tối ưu theo chuẩn PEP 8:**\n\n` +
+        `\`\`\`python\n` +
+        formatPep8Locally(effectiveCode) +
+        `\`\`\`\n\n` +
+        `✅ Đã chuẩn hóa thụt lề 4 spaces, định dạng toán tử và cấu trúc hàm theo chuẩn PEP 8 của Python! Sẵn sàng bấm **Áp dụng vào Editor**.`;
+    } else if (instruction === 'explain_line_by_line') {
+      fallbackReply = generateExplainResponseLocally(effectiveCode);
+    } else if (instruction === 'pythonic') {
+      fallbackReply = `⚡ **Cách viết ngắn hơn (Pythonic):**\n\n` +
+        `Có thể áp dụng List Comprehension hoặc hàm built-in tối ưu chuẩn PEP 8:\n\n` +
+        `\`\`\`python\n${formatPep8Locally(effectiveCode)}\n\`\`\`\n\n` +
+        `Cấu trúc này giúp mã nguồn gọn gàng, tăng tốc độ thực thi và dễ bảo trì.`;
+    } else if (instruction === 'try_except') {
+      fallbackReply = `🛡️ **Bổ sung bắt lỗi ngoại lệ try...except:**\n\n` +
+        `\`\`\`python\ntry:\n    # Thực thi mã an toàn\n` +
+        (effectiveCode ? String(effectiveCode).split('\n').map((l: string) => '    ' + l).join('\n') : '    pass') +
+        `\nexcept Exception as e:\n    print(f"❌ Xảy ra lỗi: {e}")\n\`\`\`\n\n` +
+        `Khối try...except giúp chương trình không bị crash đột ngột khi gặp lỗi nhập liệu.`;
+    } else if (instruction === 'add_comments') {
+      fallbackReply = `💬 **Mã đã thêm chú thích tiếng Việt:**\n\n` +
+        `\`\`\`python\n# ==========================================\n# 🐍 Chương trình Python\n# ==========================================\n` +
+        (effectiveCode ? String(effectiveCode).split('\n').map((l: string) => l.trim() ? `# Xử lý:\n${l}` : l).join('\n') : '# Viết mã tại đây') +
+        `\n\`\`\`\n\nĐã thêm chú thích giúp bạn dễ dàng theo dõi logic.`;
+    } else if (instruction === 'test_data') {
+      fallbackReply = `🧪 **Ví dụ dữ liệu chạy thử:**\n\n` +
+        `- Trường hợp thông thường: Dữ liệu hợp lệ theo đúng kiểu int / str.\n` +
+        `- Trường hợp biên (Edge case): Số 0, chuỗi rỗng "", hoặc giá trị âm.\n` +
+        `- Bạn có thể chạy thử trực tiếp trong Terminal để kiểm tra kết quả!`;
+    } else if (effectiveCode.trim() && (/^(chào|xin chào|hi|hello|alo|hey|trợ lý|giúp)\b/i.test(rawUserText) || rawUserText.length < 40)) {
+      fallbackReply = buildGreetingWithCodeSummary(effectiveCode);
+    } else {
+      fallbackReply = analyzeAndFixLocally(effectiveCode, errorText);
+    }
+
+    return res.json({ reply: fallbackReply, text: fallbackReply });
+  }
+});
+
+function classifyGeminiApiError(err: any): {
+  status: 'WARN' | 'FAIL';
+  httpStatus: number;
+  isQuota: boolean;
+  isAuth: boolean;
+  message: string;
+} {
+  const errMsg = String(err?.message || err || '');
+  const lower = errMsg.toLowerCase();
+
+  const isQuota =
+    lower.includes('quota') ||
+    errMsg.includes('429') ||
+    errMsg.includes('RESOURCE_EXHAUSTED');
+
+  if (isQuota) {
+    return {
+      status: 'WARN',
+      httpStatus: 429,
+      isQuota: true,
+      isAuth: false,
+      message: 'Đã đạt hạn mức Free Tier trong ngày (429 Quota Exceeded). Động cơ ngoại tuyến PEP 8 sẵn sàng phục vụ.',
+    };
+  }
+
+  const isRefererBlocked =
+    lower.includes('referer') ||
+    lower.includes('referrer') ||
+    errMsg.includes('API_KEY_HTTP_REFERRER_BLOCKED');
+
+  if (isRefererBlocked) {
+    return {
+      status: 'FAIL',
+      httpStatus: 403,
+      isQuota: false,
+      isAuth: true,
+      message:
+        'Khóa GEMINI_API_KEY đang bị giới hạn HTTP Referer nên máy chủ Render không thể gọi API. Hãy đặt Application restrictions = None trong Google Cloud Console.',
+    };
+  }
+
+  const isServiceDisabled =
+    errMsg.includes('SERVICE_DISABLED') ||
+    errMsg.includes('API_KEY_SERVICE_BLOCKED') ||
+    lower.includes('has not been used in project') ||
+    lower.includes('is disabled');
+
+  if (isServiceDisabled) {
+    return {
+      status: 'FAIL',
+      httpStatus: 403,
+      isQuota: false,
+      isAuth: true,
+      message:
+        'Generative Language API chưa được bật cho dự án của khóa GEMINI_API_KEY (403). Hãy bật Generative Language API hoặc tạo khóa mới tại aistudio.google.com/apikey.',
+    };
+  }
+
+  const isInvalidKey =
+    errMsg.includes('API_KEY_INVALID') ||
+    lower.includes('api key not valid') ||
+    lower.includes('api key expired') ||
+    errMsg.includes('403') ||
+    lower.includes('permission_denied');
+
+  if (isInvalidKey) {
+    return {
+      status: 'FAIL',
+      httpStatus: 403,
+      isQuota: false,
+      isAuth: true,
+      message:
+        'Khóa GEMINI_API_KEY trên máy chủ không hợp lệ hoặc thiếu quyền (403). Hãy kiểm tra lại biến GEMINI_API_KEY trong Render Environment (dùng khóa Gemini từ aistudio.google.com/apikey, không để dấu ngoặc kép/khoảng trắng).',
+    };
+  }
+
+  const isNotFound =
+    errMsg.includes('404') ||
+    errMsg.includes('NOT_FOUND') ||
+    lower.includes('is not found');
+
+  if (isNotFound) {
+    return {
+      status: 'WARN',
+      httpStatus: 404,
+      isQuota: false,
+      isAuth: false,
+      message: 'Mô hình chưa khả dụng trên khóa API hiện tại (404). Hệ thống sẽ chuyển sang mô hình dự phòng hoặc động cơ ngoại tuyến.',
+    };
+  }
+
+  const isBadRequest = errMsg.includes('400') || errMsg.includes('INVALID_ARGUMENT');
+  if (isBadRequest) {
+    return {
+      status: 'WARN',
+      httpStatus: 400,
+      isQuota: false,
+      isAuth: false,
+      message: 'Tham số yêu cầu không tương thích với mô hình (400).',
+    };
+  }
+
+  return {
+    status: 'WARN',
+    httpStatus: 500,
+    isQuota: false,
+    isAuth: false,
+    message: 'Mô hình tạm thời phản hồi chậm hoặc đang bận.',
   };
-
-  const contents = [...normalizedHistory, finalUserTurn];
-  return { contents, systemInstruction };
 }
 
-// Intelligent contextual Python code generator for games, requests, and feature expansions
-function generateContextualPythonCode(prompt: string, existingCode: string): string | null {
-  const raw = (prompt || '').toLowerCase().trim();
-  if (!raw) return null;
+// REST endpoint: Check server-side Gemini AI & connected Cloud Project status
+app.get(['/api/ai/status', '/api/ai/project-info'], (req, res) => {
+  const hasKey = Boolean(getCleanServerGeminiKey());
+  res.json({
+    ok: hasKey,
+    model: 'gemini-4-hydrogen',
+    fallbackModel: 'gemini-3.1-flash-lite',
+    liveModel: 'gemini-3.8-live',
+    projectId: connectedGeminiProject.projectId,
+    projectNumber: connectedGeminiProject.projectNumber,
+    renderBackend: 'https://pydroid3-android.onrender.com',
+    serverKeyConfigured: hasKey,
+    message: hasKey
+      ? `Dự án Gemini (${connectedGeminiProject.projectId}) đã nạp khóa trên máy chủ với ${CANDIDATE_MODELS[0]}.`
+      : `Dự án ${connectedGeminiProject.projectId} đã liên kết, nhưng biến GEMINI_API_KEY chưa được thiết lập trên máy chủ.`,
+  });
+});
 
-  // 1. Dice Game: Player vs Computer (Xúc xắc: Người dùng chơi với máy / Đối kháng máy tính)
-  const isDiceKeyword = /x[uú]c\s*x[aắ]c|dice|xuc\s*xac/i.test(raw) || (existingCode && existingCode.includes('xuc_xac'));
-  const isPlayVsBot = /ch[oơ]i.*(m[aá]y|bot)|ng[uư][oờ]i.*(m[aá]y|bot)|choi.*may|nguoi.*may|v[oớ]i\s+m[aá]y|đ[oố]i\s*kh[aá]ng|vs\s*bot|vs\s*computer/i.test(raw);
+// REST endpoint: Server-Side Gemini Diagnostic Test (tests connectivity & authentication completely on the server)
+app.post('/api/ai/diagnose', async (req, res) => {
+  const cleanKey = getCleanServerGeminiKey();
+  const candidateModels = [...CANDIDATE_MODELS];
+  const testedModels: Array<{
+    model: string;
+    status: 'PASS' | 'WARN' | 'FAIL';
+    latencyMs: number;
+    message: string;
+    httpStatus?: number;
+  }> = [];
 
-  if ((isDiceKeyword && isPlayVsBot) || (/x[uú]c\s*x[aắ]c/i.test(raw) && /ch[oơ]i|game/i.test(raw)) || (/vi[eế]t.*th[eê]m.*code.*ch[oơ]i/i.test(raw))) {
-    return `🎲 **Trò chơi Đổ Xúc Xắc: Người Chơi vs Máy Tính (Chuẩn PEP 8):**
-
-Dưới đây là mã nguồn Python hoàn chỉnh đã được bổ sung đầy đủ tính năng người dùng đối kháng với máy tính, có tính điểm từng ván và hỏi người chơi có muốn tiếp tục hay không:
-
-\`\`\`python
-"""
-Trò chơi Đổ Xúc Xắc: Người Chơi vs Máy Tính (PEP 8 Standard)
-Tương thích hoàn hảo với Pydroid 3 Web & Android Terminal.
-"""
-import random
-import time
-
-
-def do_xuc_xac() -> int:
-    """Tung một con xúc xắc ngẫu nhiên từ 1 đến 6 điểm."""
-    return random.randint(1, 6)
-
-
-def choi_mot_van(van_so: int) -> tuple[int, int]:
-    """Thực hiện một ván đấu giữa Người chơi và Máy tính."""
-    print(f"\\n🎲 ================== VÁN {van_so} ==================")
-    input("👉 Nhấn [Enter] để tung xúc xắc của bạn...")
-
-    diem_nguoi = do_xuc_xac()
-    print(f"👤 Bạn đã tung được : {diem_nguoi} điểm 🎲")
-
-    print("🤖 Máy tính đang tung xúc xắc...")
-    time.sleep(0.5)
-    diem_may = do_xuc_xac()
-    print(f"🤖 Máy tính tung được: {diem_may} điểm 🎲")
-
-    if diem_nguoi > diem_may:
-        print("🎉 Chúc mừng! BẠN ĐÃ THẮNG ván này!")
-    elif diem_nguoi < diem_may:
-        print("😢 Rất tiếc, Máy tính đã thắng ván này!")
-    else:
-        print("🤝 Kết quả hòa! Cả hai bên đều bằng điểm.")
-
-    return diem_nguoi, diem_may
-
-
-def main() -> None:
-    """Hàm điều khiển luồng chính của trò chơi."""
-    print("=" * 50)
-    print(" 🎲 GAME ĐỔ XÚC XẮC: NGƯỜI CHƠI VS MÁY TÍNH 🎲 ")
-    print("=" * 50)
-
-    thang_nguoi = 0
-    thang_may = 0
-    hoa = 0
-    van_so = 1
-
-    while True:
-        diem_nguoi, diem_may = choi_mot_van(van_so)
-
-        if diem_nguoi > diem_may:
-            thang_nguoi += 1
-        elif diem_nguoi < diem_may:
-            thang_may += 1
-        else:
-            hoa += 1
-
-        print(f"\\n📊 TỔNG TỶ SỐ: Bạn [{thang_nguoi}] - Máy [{thang_may}] - Hòa [{hoa}]")
-
-        tiep_tuc = input("\\nBạn có muốn chơi tiếp ván nữa không? (y/n): ").strip().lower()
-        if tiep_tuc not in ("y", "yes", "co", "c", "1"):
-            print("\\n👋 Cảm ơn bạn đã trải nghiệm trò chơi! Hẹn gặp lại!")
-            break
-
-        van_so += 1
-
-
-if __name__ == "__main__":
-    main()
-\`\`\`
-
-✨ **Các cải tiến đã thêm:**
-1. **Tương tác trực tiếp:** Người chơi nhấn \`Enter\` để tung xúc xắc của mình.
-2. **Cơ chế máy tính tự động:** Máy tính tự động tung ngẫu nhiên và so sánh kết quả.
-3. **Bảng điểm liên tục:** Lưu giữ tỷ số thắng/thua/hòa qua các ván đấu.
-4. **Chuẩn PEP 8:** Thụt lề 4 khoảng trắng, type hints rõ ràng, khối \`if __name__ == "__main__":\`.
-
-👉 *Nhấn nút **"Áp dụng vào Editor"** ngay trên khối code để nạp vào trình soạn thảo và bấm nút **RUN** màu vàng để chơi ngay!*`;
+  if (!cleanKey) {
+    for (const model of candidateModels) {
+      testedModels.push({
+        model,
+        status: 'FAIL',
+        latencyMs: 0,
+        message: 'Chưa thiết lập biến môi trường GEMINI_API_KEY trên máy chủ.',
+        httpStatus: 401,
+      });
+    }
+    return res.json({
+      ok: false,
+      overallStatus: 'FAIL',
+      serverSide: true,
+      projectId: connectedGeminiProject.projectId,
+      projectNumber: connectedGeminiProject.projectNumber,
+      serverKeyConfigured: false,
+      summaryMessage:
+        'Chưa có biến GEMINI_API_KEY trên máy chủ. Hãy thêm GEMINI_API_KEY trong Render Dashboard -> Environment.',
+      testedModels,
+      timestamp: new Date().toISOString(),
+    });
   }
 
-  // 2. Number guessing game (Trò chơi đoán số)
-  if (/đo[aá]n\s+s[oố]|guessing|guess.*number/i.test(raw)) {
-    return `🎯 **Trò chơi Đoán Số Bí Mật (Chuẩn PEP 8):**
+  let anyPassed = false;
+  let encounteredQuota = false;
+  let encounteredAuthError = false;
+  let firstErrorMessage = '';
 
-\`\`\`python
-import random
+  for (const model of candidateModels) {
+    const t0 = Date.now();
+    try {
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model,
+          contents: 'ping',
+          config: {
+            maxOutputTokens: 5,
+          },
+        }),
+        6000
+      );
+      const latencyMs = Date.now() - t0;
+      if (response && response.text) {
+        anyPassed = true;
+        testedModels.push({
+          model,
+          status: 'PASS',
+          latencyMs,
+          message: 'Kết nối và xác thực thành công từ máy chủ',
+          httpStatus: 200,
+        });
+      } else {
+        testedModels.push({
+          model,
+          status: 'WARN',
+          latencyMs,
+          message: 'Không nhận được văn bản phản hồi',
+          httpStatus: 200,
+        });
+      }
+    } catch (err: any) {
+      const latencyMs = Date.now() - t0;
+      const classified = classifyGeminiApiError(err);
+      if (classified.isQuota) encounteredQuota = true;
+      if (classified.isAuth) encounteredAuthError = true;
+      if (!firstErrorMessage) firstErrorMessage = classified.message;
 
-
-def choi_doan_so() -> None:
-    """Trò chơi đoán số ngẫu nhiên từ 1 đến 100."""
-    so_bi_mat = random.randint(1, 100)
-    so_lan_doan = 0
-    print("🎯 Chào mừng bạn đến với Game Đoán Số (1 - 100)!")
-
-    while True:
-        try:
-            doan = int(input("👉 Nhập số bạn đoán (1-100): "))
-            so_lan_doan += 1
-            if doan < so_bi_mat:
-                print("📈 Quá nhỏ! Hãy thử số lớn hơn.")
-            elif doan > so_bi_mat:
-                print("📉 Quá lớn! Hãy thử số nhỏ hơn.")
-            else:
-                print(f"🎉 Xuất sắc! Bạn đã đoán đúng số {so_bi_mat} sau {so_lan_doan} lần.")
-                break
-        except ValueError:
-            print("⚠️ Vui lòng nhập số nguyên hợp lệ!")
-
-
-if __name__ == "__main__":
-    choi_doan_so()
-\`\`\`
-
-👉 *Nhấn nút **"Áp dụng vào Editor"** ngay trên khối code để nạp vào trình soạn thảo!*`;
-  }
-
-  // 3. Rock Paper Scissors (Kéo - Búa - Bao)
-  if (/k[eé]o\s+b[uú]a\s+bao|o[aẳ]n\s+t[uù]\s+t[iì]|rock.*paper.*scissors/i.test(raw)) {
-    return `✂️ **Trò chơi Kéo - Búa - Bao: Người Chơi vs Máy Tính (Chuẩn PEP 8):**
-
-\`\`\`python
-import random
-
-LUA_CHON = ["kéo", "búa", "bao"]
-
-
-def choi_keo_bua_bao() -> None:
-    print("✂️🔨📄 GAME KÉO - BÚA - BAO ✂️🔨📄")
-    while True:
-        nguoi = input("\\nNhập lựa chọn của bạn (kéo, búa, bao) hoặc 'thoat': ").strip().lower()
-        if nguoi == "thoat":
-            print("👋 Tạm biệt bạn!")
-            break
-        if nguoi not in LUA_CHON:
-            print("⚠️ Lựa chọn không hợp lệ, hãy nhập: kéo, búa hoặc bao.")
-            continue
-
-        may = random.choice(LUA_CHON)
-        print(f"🤖 Máy tính chọn: {may}")
-
-        if nguoi == may:
-            print("🤝 Hòa nhau!")
-        elif (
-            (nguoi == "kéo" and may == "bao")
-            or (nguoi == "búa" and may == "kéo")
-            or (nguoi == "bao" and may == "búa")
-        ):
-            print("🎉 BẠN THẮNG!")
-        else:
-            print("😢 MÁY TÍNH THẮNG!")
-
-
-if __name__ == "__main__":
-    choi_keo_bua_bao()
-\`\`\`
-
-👉 *Nhấn nút **"Áp dụng vào Editor"** ngay trên khối code để nạp vào trình soạn thảo!*`;
-  }
-
-  // 4. Algorithms / Math / Factorial / Primes / Fibonacci
-  if (/nguy[eê]n\s+t[oố]|fibonacci|giai\s+th[uừ]a|ucln|bcnn/i.test(raw)) {
-    return `💡 **Chương trình Python Xử Lý Toán Học Thuật Toán (Chuẩn PEP 8):**
-
-\`\`\`python
-def kiem_tra_nguyen_to(n: int) -> bool:
-    """Kiểm tra số nguyên tố tối ưu O(sqrt(N))."""
-    if n < 2:
-        return False
-    for i in range(2, int(n ** 0.5) + 1):
-        if n % i == 0:
-            return False
-    return True
-
-
-def day_fibonacci(n: int) -> list[int]:
-    """Tạo danh sách N số Fibonacci đầu tiên."""
-    if n <= 0:
-        return []
-    if n == 1:
-        return [0]
-    fib = [0, 1]
-    for _ in range(2, n):
-        fib.append(fib[-1] + fib[-2])
-    return fib
-
-
-def main() -> None:
-    print("--- CHƯƠNG TRÌNH XỬ LÝ TOÁN HỌC PYTHON ---")
-    try:
-        n = int(input("Nhập một số nguyên dương N: "))
-        print(f"Số {n} là số nguyên tố? -> {'CÓ' if kiem_tra_nguyen_to(n) else 'KHÔNG'}")
-        print(f"Dãy {n} số Fibonacci đầu tiên: {day_fibonacci(n)}")
-    except ValueError:
-        print("⚠️ Vui lòng nhập số nguyên hợp lệ!")
-
-
-if __name__ == "__main__":
-    main()
-\`\`\`
-
-👉 *Nhấn nút **"Áp dụng vào Editor"** ngay trên khối code để nạp vào trình soạn thảo!*`;
-  }
-
-  // 5. General "viết code", "viết thêm", "thêm tính năng"
-  if (/vi[eế]t.*code|th[eê]m.*code|vi[eế]t.*h[aà]m|vi[eế]t.*ch[uư][oơ]ng\s*tr[iì]nh|t[aạ]o.*code/i.test(raw)) {
-    if (existingCode && existingCode.trim().length > 10) {
-      const formatted = formatPep8Locally(existingCode);
-      return `💡 **Mã nguồn Python theo yêu cầu của bạn (Chuẩn PEP 8):**
-
-\`\`\`python
-${formatted}
-\`\`\`
-
-✨ **Điểm nổi bật:**
-- Đã được chuẩn hóa theo tiêu chuẩn **PEP 8** chính thức.
-- Sẵn sàng nhấn nút **"Áp dụng vào Editor"** phía trên khối code để nạp trực tiếp vào trình soạn thảo!`;
+      testedModels.push({
+        model,
+        status: classified.status,
+        latencyMs,
+        message: classified.message,
+        httpStatus: classified.httpStatus,
+      });
     }
   }
 
-  return null;
-}
+  const overallStatus = anyPassed
+    ? 'PASS'
+    : encounteredQuota
+    ? 'WARN'
+    : encounteredAuthError
+    ? 'FAIL'
+    : 'WARN';
 
-// Guaranteed smart fallback generator for offline or connection issues
-function generateLocalChatFallback(code: string, messages: any[], instruction: string, errorText: string): string {
-  const lastUserMsg = messages[messages.length - 1];
-  const userText = String(lastUserMsg?.text || '').trim();
-  const rawUserText = userText.toLowerCase();
+  const summaryMessage = anyPassed
+    ? `Dự án Gemini (${connectedGeminiProject.projectId}) hoạt động sẵn sàng từ máy chủ.`
+    : firstErrorMessage ||
+      'Không thể xác thực với Gemini API lúc này. Động cơ ngoại tuyến PEP 8 vẫn sẵn sàng.';
 
-  const isErrorAnalysis =
-    instruction === 'fix_error' ||
-    instruction === 'analyze_fix_clean' ||
-    /s[uư][aảã].*l[oô][iỉĩ]|l[oô][iỉĩ]|fix.*error|fix.*bug|debug|g[oỡ].*l[oô][iỉĩ]|b[iị].*l[oô][iỉĩ]|d[oò]ng.*m[aấ]y.*l[oô][iỉĩ]|s[uư][aảã].*code/i.test(rawUserText);
+  res.json({
+    ok: anyPassed || encounteredQuota,
+    overallStatus,
+    serverSide: true,
+    projectId: connectedGeminiProject.projectId,
+    projectNumber: connectedGeminiProject.projectNumber,
+    serverKeyConfigured: true,
+    summaryMessage,
+    testedModels,
+    timestamp: new Date().toISOString(),
+  });
+});
 
-  // 1. Error analysis / bug fixing request
-  if (instruction === 'fix_error' || instruction === 'analyze_fix_clean' || isErrorAnalysis) {
-    return analyzeAndFixLocally(code, errorText);
-  }
-
-  // 2. Contextual code generation (dice game, player vs bot, number guessing, math, custom code, etc.)
-  const contextualCode = generateContextualPythonCode(userText, code);
-  if (contextualCode) {
-    return contextualCode;
-  }
-
-  // 3. Greetings & Salutations (e.g. "xin chào trợ lý")
-  if (/^(xin\s+ch[aà]o|ch[aà]o|hello|hi\b|alo|h[eé] l[oô]|ch[aà]o\s+b[aạ]n)/i.test(rawUserText)) {
-    return `👋 **Xin chào bạn!** Tôi là **Trợ lý Trí tuệ Nhân tạo Gemini AI** trên Pydroid 3.
-
-Tôi luôn sẵn sàng đồng hành cùng bạn học và lập trình Python:
-- 🛠️ **Gỡ lỗi & Sửa mã nguồn:** Tự động phát hiện lỗi, chỉ rõ số dòng và viết lại code hoàn chỉnh chuẩn PEP 8.
-- 📖 **Giải thích chi tiết:** Phân tích logic từng dòng mã, cấu trúc hàm và thuật toán.
-- ⚡ **Tối ưu hóa Pythonic:** Rút gọn code, tăng tốc độ thực thi, thêm xử lý ngoại lệ \`try...except\`.
-- ✍️ **Viết code theo yêu cầu:** Bạn có thể yêu cầu tôi viết bất kỳ chương trình Python nào (toán học, xử lý chuỗi, game, mảng...).
-
-Bạn muốn cùng tôi thực hiện bài toán hoặc chức năng nào ngay bây giờ? Hãy nhắn câu hỏi bên dưới nhé!`;
-  }
-
-  // 4. Question about assistant capabilities
-  if (/b[aạ]n\s+l[aà]\s+ai|b[aạ]n\s+c[oó]\s+th[eể]|l[aà]m\s+đ[uư][oợ]c\s+g[iì]|gi[uú]p\s+g[iì]|h[uư][oớ]ng\s+d[aẫ]n/i.test(rawUserText)) {
-    return `🤖 **Tôi là Trợ lý AI Lập trình Python chuyên biệt cho Pydroid 3 Web & APK!**
-
-Các tính năng nổi bật:
-1. **Kiểm tra và sửa lỗi tự động:** Bấm nút **"Sửa lỗi code"** hoặc **"Lỗi dòng nào"** để phân tích mã lỗi từ Terminal.
-2. **Chuẩn hóa PEP 8:** Bấm nút **"Tối ưu PEP 8"** để tự động căn lề 4 khoảng trắng, định dạng biến snake_case.
-3. **Soạn thảo chương trình:** Nhập yêu cầu bằng tiếng Việt (ví dụ: *"viết game xúc xắc người chơi với máy"*, *"viết hàm kiểm tra số nguyên tố"*...).
-4. **Học tập:** Xem kho bài tập phong phú tại biểu tượng 🎓 Mũ cử nhân trên thanh công cụ!`;
-  }
-
-  // 5. Optimization & Special instructions
-  if (instruction === 'optimize_pep8' || /t[oố]i\s+[uư]u.*pep/i.test(rawUserText)) {
-    return `⚡ **Mã nguồn đã tối ưu theo chuẩn PEP 8:**\n\n\`\`\`python\n${formatPep8Locally(code)}\`\`\`\n\n✅ Đã chuẩn hóa thụt lề 4 spaces, định dạng toán tử và cấu trúc hàm theo chuẩn PEP 8 của Python! Sẵn sàng bấm **Áp dụng vào Editor**.`;
-  } else if (instruction === 'explain_line_by_line') {
-    return `🔍 **Giải thích từng phần mã nguồn:**\n\n- Mã nguồn của bạn đang xử lý các tác vụ logic chính.\n- Các hàm và biến được khởi tạo tuần tự từ trên xuống dưới.\n- Bạn có thể hỏi sâu hơn về bất kỳ dòng code hoặc biến cụ thể nào!`;
-  } else if (instruction === 'pythonic') {
-    return `⚡ **Cách viết ngắn hơn (Pythonic):**\n\nCó thể áp dụng List Comprehension hoặc hàm built-in tối ưu chuẩn PEP 8:\n\n\`\`\`python\n${formatPep8Locally(code)}\`\`\`\n\nCấu trúc này giúp mã nguồn gọn gàng, tăng tốc độ thực thi và dễ bảo trì.`;
-  } else if (instruction === 'try_except') {
-    return `🛡️ **Bổ sung bắt lỗi ngoại lệ try...except:**\n\n\`\`\`python\ntry:\n    # Thực thi mã an toàn\n${code ? String(code).split('\n').map((l: string) => '    ' + l).join('\n') : '    pass'}\nexcept Exception as e:\n    print(f"❌ Xảy ra lỗi: {e}")\n\`\`\`\n\nKhối try...except giúp chương trình không bị crash đột ngột khi gặp lỗi nhập liệu.`;
-  } else if (instruction === 'add_comments') {
-    return `💬 **Mã đã thêm chú thích tiếng Việt:**\n\n\`\`\`python\n# ==========================================\n# 🐍 Chương trình Python\n# ==========================================\n${code ? String(code).split('\n').map((l: string) => l.trim() ? `# Xử lý:\n${l}` : l).join('\n') : '# Viết mã tại đây'}\n\`\`\`\n\nĐã thêm chú thích giúp bạn dễ dàng theo dõi logic.`;
-  } else if (instruction === 'test_data') {
-    return `🧪 **Ví dụ dữ liệu chạy thử:**\n\n- Trường hợp thông thường: Dữ liệu hợp lệ theo đúng kiểu int / str.\n- Trường hợp biên (Edge case): Số 0, chuỗi rỗng "", hoặc giá trị âm.\n- Bạn có thể chạy thử trực tiếp trong Terminal để kiểm tra kết quả!`;
-  }
-
-  // 6. Only explain source code if user explicitly requested explanation
-  if (instruction === 'explain_source_code' || instruction === 'initial_explain' || /gi[aả]i\s+th[ií]ch/i.test(rawUserText)) {
-    if (code && code.trim()) {
-      return generateExplainResponseLocally(code);
-    }
-  }
-
-  // 7. Fallback general response with helpful suggestion
-  if (code && code.trim()) {
-    return generateExplainResponseLocally(code);
-  }
-
-  return `🤖 Tôi đã nhận được yêu cầu: *"**${userText}**"*. 
-
-Bạn có thể chọn một trong các nút chức năng nhanh phía trên:
-- 🛠️ **Sửa lỗi code**: Khắc phục lỗi và tạo mã mới chạy ngay.
-- 📖 **Giải thích**: Nắm rõ logic từng phần mã nguồn.
-- ✨ **Tối ưu PEP 8**: Chuẩn hóa phong cách lập trình Python chuyên nghiệp.`;
-}
-
-// REST endpoint: Gemini AI Streaming Chat (Server-Sent Events)
-app.post('/api/ai/chat/stream', async (req, res) => {
-  const { code = '', messages = [], instruction = '', errorText = '' } = req.body;
-  const { aiClient, hasKey, isCustom, hasServerKey } = getAiClient(req);
-
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
-  res.write(': keep-alive\n\n');
-
-  if (!hasKey) {
-    const notice =
-      '⚠️ **Chưa kết nối được Google Gemini AI:** Máy chủ chưa có `GEMINI_API_KEY` hợp lệ trong AI Studio **Settings > Secrets**.\n\n---\n\n';
-    const fallbackText = generateLocalChatFallback(code, messages, instruction, errorText);
-    res.write(`data: ${JSON.stringify({ text: `${notice}${fallbackText}` })}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-    return;
+// REST endpoint: Server-Side API Key Test
+app.post('/api/ai/test-key', async (req, res) => {
+  const effectiveKey = getCleanServerGeminiKey();
+  if (!effectiveKey) {
+    return res.json({
+      ok: false,
+      message: 'Chưa có khóa Gemini API Key trên máy chủ.',
+    });
   }
 
   try {
-    const { contents, systemInstruction } = buildChatPayload(code, messages, instruction, errorText);
+    const candidateModels = [...CANDIDATE_MODELS];
+    let lastError: any = null;
+    for (const model of candidateModels) {
+      try {
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: 'ping',
+            config: { maxOutputTokens: 5 },
+          }),
+          5000
+        );
 
-    let streamed = false;
-    let customError: any = null;
-    let lastStreamError: any = null;
-    const clientsToTry = isCustom && hasServerKey ? [aiClient, ai] : [aiClient];
+        if (response && response.text) {
+          return res.json({
+            ok: true,
+            message: `Máy chủ Gemini AI xác thực thành công (${model})!`,
+            model,
+            projectId: connectedGeminiProject.projectId,
+          });
+        }
+      } catch (mErr: any) {
+        lastError = mErr;
+        continue;
+      }
+    }
 
-    // 1. Attempt streaming across candidate models (auto-fallback to server key if custom key rejected)
-    for (const activeClient of clientsToTry) {
-      if (streamed) break;
+    const classified = classifyGeminiApiError(lastError);
+    return res.json({
+      ok: false,
+      message: classified.message,
+      httpStatus: classified.httpStatus,
+      projectId: connectedGeminiProject.projectId,
+    });
+  } catch (err: any) {
+    const classified = classifyGeminiApiError(err);
+    return res.json({
+      ok: false,
+      message: classified.message,
+      httpStatus: classified.httpStatus,
+      projectId: connectedGeminiProject.projectId,
+    });
+  }
+});
 
-      for (const model of getOrderedCandidateModels()) {
-        const tryStream = async (useThinking: boolean): Promise<boolean> => {
-          const modelConfig: any = { systemInstruction };
-          if (useThinking && supportsThinkingConfig(model)) {
-            modelConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-          }
+// Single Persistent Streaming Gemini AI Backend Endpoint
+app.post(['/api/ai/stream', '/api/ai/chat/stream'], async (req, res) => {
+  // Set headers specifically configured for Android WebViews and mobile networks
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'none',
+  });
 
-          const streamPromise = activeClient.models.generateContentStream({
+  // Immediately send initial comment to flush connection to Android WebView
+  res.write(': stream-connected\n\n');
+  if (typeof (res as any).flush === 'function') (res as any).flush();
+
+  // Keep-alive heartbeat every 2.5s to prevent Android WebView / intermediate proxies from dropping connection
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': ping\n\n');
+      if (typeof (res as any).flush === 'function') (res as any).flush();
+    }
+  }, 2500);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+  });
+
+  const { code = '', messages = [], instruction = '', errorText = '', prompt = '' } = req.body;
+  const effectiveCode = extractCodeFromRequest(code, prompt, messages);
+
+  try {
+    const rawList: Array<{ role: 'user' | 'model'; text: string }> = [];
+    if (Array.isArray(messages)) {
+      for (const m of messages) {
+        const txt = (m.text || m.content || '').trim();
+        if (!txt) continue;
+        const role = m.sender === 'user' || m.role === 'user' ? 'user' : 'model';
+        rawList.push({ role, text: txt });
+      }
+    }
+
+    const codeLines = effectiveCode ? effectiveCode.split('\n') : [];
+    const numberedCode = codeLines
+      .map((l: string, idx: number) => `${idx + 1}: ${l}`)
+      .join('\n');
+
+    let userPrompt = prompt || '';
+    if (!userPrompt) {
+      const lastMsg = rawList[rawList.length - 1];
+      userPrompt = lastMsg?.text || 'Hãy phân tích mã nguồn hiện tại của mình.';
+    }
+
+    const contextContent = [
+      `[MÃ PYTHON HIỆN TẠI TRONG EDITOR]:\n\`\`\`python\n${numberedCode || '# (Trống)'}\n\`\`\``,
+      errorText ? `\n[THÔNG BÁO LỖI GẦN NHẤT]:\n\`\`\`\n${errorText}\n\`\`\`` : '',
+      `\n[YÊU CẦU]:\n${userPrompt}`,
+    ].filter(Boolean).join('\n');
+
+    rawList.push({ role: 'user', text: contextContent });
+
+    // Enforce strict alternating turns for Google Gemini API
+    const mergedTurns: Array<{ role: 'user' | 'model'; text: string }> = [];
+    for (const item of rawList) {
+      if (mergedTurns.length > 0 && mergedTurns[mergedTurns.length - 1].role === item.role) {
+        mergedTurns[mergedTurns.length - 1].text += '\n\n' + item.text;
+      } else {
+        mergedTurns.push({ ...item });
+      }
+    }
+
+    if (mergedTurns.length > 0 && mergedTurns[0].role !== 'user') {
+      mergedTurns.unshift({ role: 'user', text: 'Bắt đầu phiên hỗ trợ Python.' });
+    }
+    if (mergedTurns.length > 0 && mergedTurns[mergedTurns.length - 1].role !== 'user') {
+      mergedTurns.push({ role: 'user', text: 'Tiếp tục phân tích.' });
+    }
+
+    const contents = mergedTurns.map((turn) => ({
+      role: turn.role,
+      parts: [{ text: turn.text }],
+    }));
+
+    const systemInstruction = `Bạn là Trợ lý AI Lập trình Python thông minh trên ứng dụng Pydroid 3 Web cho Android.
+Nhiệm vụ: Hỗ trợ người dùng học, viết, phân tích, tối ưu và sửa lỗi mã Python bằng tiếng Việt chuẩn mực, thân thiện.
+Khi sửa lỗi hoặc viết lại code:
+- Luôn chỉ rõ vị trí dòng lỗi và nguyên nhân bằng tiếng Việt.
+- Luôn bọc toàn bộ mã Python hoàn chỉnh, chạy được 100% trong khối \`\`\`python ... \`\`\` chuẩn PEP 8 để người dùng bấm "Áp dụng vào Editor" một chạm.`;
+
+    const effectiveApiKey = (process.env.GEMINI_API_KEY || '').trim();
+    let streamSuccess = false;
+
+    if (effectiveApiKey) {
+      const candidateModels = [...CANDIDATE_MODELS];
+
+      for (const model of candidateModels) {
+        try {
+          const streamPromise = ai.models.generateContentStream({
             model,
             contents,
-            config: modelConfig,
+            config: {
+              systemInstruction,
+            },
           });
 
-          const stream = await withTimeout(streamPromise, 15000);
-          let gotAny = false;
-          for await (const chunk of stream) {
-            const text = chunk.text || '';
+          // 7s timeout to allow rapid streaming while resilient against temporary network lags
+          const responseStream = await Promise.race([
+            streamPromise,
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Model timeout')), 7000)),
+          ]);
+
+          for await (const chunk of responseStream) {
+            const text = chunk.text;
             if (text) {
               res.write(`data: ${JSON.stringify({ text })}\n\n`);
-              gotAny = true;
+              if (typeof (res as any).flush === 'function') (res as any).flush();
+              streamSuccess = true;
             }
           }
-          return gotAny;
-        };
 
-        try {
-          streamed = await tryStream(true);
-          if (streamed) {
-            cachedWorkingModel = model;
+          if (streamSuccess) {
             break;
           }
-        } catch (streamErr: any) {
-          const status = (streamErr?.status as number) || (streamErr?.statusCode as number);
-          if (status === 400 && supportsThinkingConfig(model) && !isAuthOrPermissionError(streamErr)) {
-            try {
-              streamed = await tryStream(false);
-              if (streamed) {
-                cachedWorkingModel = model;
-                break;
-              }
-            } catch (retryErr: any) {
-              if (isCustom && activeClient === aiClient) customError = retryErr;
-              lastStreamError = retryErr;
-            }
-          } else {
-            if (isCustom && activeClient === aiClient) customError = streamErr;
-            lastStreamError = streamErr;
-          }
-
-          const friendlyNotice = extractFriendlyGeminiError(lastStreamError).friendly;
-          console.log(`[AI Streaming] ${model}: ${friendlyNotice}`);
-
-          if (isAuthOrPermissionError(lastStreamError)) {
-            break;
-          }
+        } catch (mErr: any) {
           continue;
         }
       }
     }
 
-    // 2. If streaming didn't output chunks, try non-streaming generateContent using the same active clients (custom key first!)
-    if (!streamed) {
-      for (const activeClient of clientsToTry) {
-        if (streamed) break;
-        for (const model of getOrderedCandidateModels()) {
-          try {
-            const modelConfig: any = { systemInstruction };
-            const resp = await withTimeout(
-              activeClient.models.generateContent({
-                model,
-                contents,
-                config: modelConfig,
-              }),
-              15000
-            );
-            if (resp && resp.text) {
-              cachedWorkingModel = model;
-              res.write(`data: ${JSON.stringify({ text: resp.text })}\n\n`);
-              streamed = true;
-              break;
-            }
-          } catch (genErr: any) {
-            if (isCustom && activeClient === aiClient && !customError) customError = genErr;
-            lastStreamError = genErr;
-            if (isAuthOrPermissionError(genErr)) break;
-            continue;
-          }
+    // If no key or remote models failed, stream smart offline analysis immediately
+    if (!streamSuccess) {
+      const lowerPrompt = (userPrompt || '').trim().toLowerCase();
+      let fallbackText = '';
+
+      if (instruction === 'optimize_pep8' || instruction === 'pep8' || lowerPrompt.includes('pep8') || lowerPrompt.includes('tối ưu')) {
+        fallbackText = `⚡ **Mã nguồn đã tối ưu theo chuẩn PEP 8:**\n\n\`\`\`python\n${formatPep8Locally(effectiveCode)}\`\`\`\n\n✅ Đã chuẩn hóa thụt lề 4 khoảng trắng, định dạng toán tử và cấu trúc hàm theo chuẩn PEP 8. Nhấn nút **"Áp dụng vào Editor"** để cập nhật!`;
+      } else if (instruction === 'explain_source_code' || instruction === 'explain_line_by_line' || instruction === 'explain' || lowerPrompt.includes('giải thích') || lowerPrompt.includes('explain')) {
+        fallbackText = generateExplainResponseLocally(effectiveCode);
+      } else if (
+        instruction === 'fix_error' ||
+        instruction === 'analyze_fix_clean' ||
+        /s[uư][aảã].*l[oô][iỉĩ]|l[oô][iỉĩ]|fix|bug|debug|g[oỡ].*l[oô][iỉĩ]|d[oò]ng.*m[aấ]y/i.test(lowerPrompt)
+      ) {
+        fallbackText = analyzeAndFixLocally(effectiveCode, errorText);
+      } else if (effectiveCode.trim() && (/^(chào|xin chào|hi|hello|alo|hey|trợ lý|giúp)\b/i.test(lowerPrompt) || lowerPrompt.length < 40)) {
+        fallbackText = buildGreetingWithCodeSummary(effectiveCode);
+      } else {
+        fallbackText = analyzeAndFixLocally(effectiveCode, errorText);
+      }
+
+      // Stream out the fallback response smoothly in natural high-speed chunks
+      const words = fallbackText.split(' ');
+      let currentChunk = '';
+      for (let i = 0; i < words.length; i++) {
+        currentChunk += (i > 0 ? ' ' : '') + words[i];
+        if (currentChunk.length >= 25 || i === words.length - 1) {
+          res.write(`data: ${JSON.stringify({ text: currentChunk })}\n\n`);
+          if (typeof (res as any).flush === 'function') (res as any).flush();
+          currentChunk = '';
+          await new Promise((r) => setTimeout(r, 2));
         }
       }
     }
 
-    // 3. If upstream AI models were unavailable or rejected, show exact error notice + local PEP 8 fallback
-    if (!streamed) {
-      const effectiveError = isCustom ? (customError || lastStreamError) : lastStreamError;
-      const friendlyReason = effectiveError
-        ? extractFriendlyGeminiError(effectiveError).friendly
-        : 'Không nhận được phản hồi từ Google Gemini.';
-      const notice = `⚠️ **Chưa kết nối được Google Gemini AI:** ${friendlyReason}\n💡 *Ứng dụng không dùng cổng nhập khóa API thủ công; kết nối AI trực tuyến lấy khóa từ **Settings > Secrets** của dự án Google AI Studio. Bên dưới là kết quả phân tích PEP 8 nội bộ:*\n\n---\n\n`;
-      const fallbackText = generateLocalChatFallback(code, messages, instruction, errorText);
-      res.write(`data: ${JSON.stringify({ text: `${notice}${fallbackText}` })}\n\n`);
-    }
-
+    clearInterval(heartbeat);
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err: any) {
-    const diag = classifyServerAiError(err);
-    const friendlyReason = extractFriendlyGeminiError(err).friendly;
-    printTerminalAiDiagnostic({
-      endpoint: '/api/ai/chat/stream',
-      operation: 'Streaming Chat',
-      failureType: diag.failureType,
-      errorMessage: friendlyReason,
-      remediation: diag.remediation,
-    });
-    const notice = `⚠️ **Chưa kết nối được Google Gemini AI:** ${friendlyReason}\n\n---\n\n`;
-    const fallbackText = generateLocalChatFallback(code, messages, instruction, errorText);
-    res.write(`data: ${JSON.stringify({ text: `${notice}${fallbackText}` })}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-  }
-});
+    clearInterval(heartbeat);
 
-// REST endpoint: Gemini AI Python Coding Assistant Multi-turn Chat
-app.post('/api/ai/chat', async (req, res) => {
-  const { code = '', messages = [], instruction = '', errorText = '' } = req.body;
-  const { aiClient, hasKey, isCustom, hasServerKey } = getAiClient(req);
-
-  if (!hasKey) {
-    const notice =
-      '⚠️ **Chưa kết nối được Google Gemini AI:** Máy chủ chưa có `GEMINI_API_KEY` hợp lệ trong AI Studio **Settings > Secrets**.\n\n---\n\n';
-    const fallback = generateLocalChatFallback(code, messages, instruction, errorText);
-    return res.json({ reply: `${notice}${fallback}` });
-  }
-
-  try {
-    const { contents, systemInstruction } = buildChatPayload(code, messages, instruction, errorText);
-    const clientsToTry = isCustom && hasServerKey ? [aiClient, ai] : [aiClient];
-    let response: any = null;
-    let customError: any = null;
-    let lastClientErr: any = null;
-
-    for (const activeClient of clientsToTry) {
-      try {
-        response = await callWithModelFallback(async (modelName) => {
-          try {
-            const modelConfig: any = { systemInstruction };
-            if (supportsThinkingConfig(modelName)) {
-              modelConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-            }
-            return await withTimeout(
-              activeClient.models.generateContent({
-                model: modelName,
-                contents,
-                config: modelConfig,
-              }),
-              35000
-            );
-          } catch (err: any) {
-            const status = (err?.status as number) || (err?.statusCode as number);
-            if (status === 400 && supportsThinkingConfig(modelName) && !isAuthOrPermissionError(err)) {
-              return await withTimeout(
-                activeClient.models.generateContent({
-                  model: modelName,
-                  contents,
-                  config: { systemInstruction },
-                }),
-                35000
-              );
-            }
-            throw err;
-          }
-        });
-        if (response?.text) break;
-      } catch (clientErr: any) {
-        if (isCustom && activeClient === aiClient) customError = clientErr;
-        lastClientErr = clientErr;
-      }
-    }
-
-    if (!response) throw (customError || lastClientErr || new Error('Không nhận được phản hồi từ mô hình'));
-
-    const replyText = response.text || 'Xin lỗi, mình chưa thể xử lý câu trả lời lúc này.';
-    return res.json({ reply: replyText });
-  } catch (err: any) {
-    const diag = classifyServerAiError(err);
-    const friendlyReason = extractFriendlyGeminiError(err).friendly;
-    printTerminalAiDiagnostic({
-      endpoint: '/api/ai/chat',
-      operation: 'Multi-turn Chat',
-      failureType: diag.failureType,
-      errorMessage: friendlyReason,
-      remediation: diag.remediation,
-    });
-    console.log('[AI Chat] Kích hoạt phân tích thông minh dự phòng.');
-    const notice = `⚠️ **Chưa kết nối được Google Gemini AI:** ${friendlyReason}\n💡 *Ứng dụng không dùng cổng nhập khóa API thủ công; kết nối AI trực tuyến lấy khóa từ **Settings > Secrets** của dự án Google AI Studio. Bên dưới là kết quả phân tích PEP 8 nội bộ:*\n\n---\n\n`;
-    const fallbackReply = generateLocalChatFallback(code, messages, instruction, errorText);
-    return res.json({ reply: `${notice}${fallbackReply}` });
-  }
-});
-
-// REST endpoint: Verify Server Gemini AI Status (supports GET & POST with no-store caching)
-app.all('/api/ai/status', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  const { aiClient, hasKey } = getAiClient(req);
-  const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || String(req.headers.host || '').includes('onrender.com'));
-  const rawEnvGemini = (process.env.GEMINI_API_KEY || '').trim();
-  const rawEnvGoogle = (process.env.GOOGLE_API_KEY || '').trim();
-  const activeRawKey = rawEnvGemini || rawEnvGoogle;
-  const keyPrefix = getKeyPrefixCategory(activeRawKey);
-
-  if (!hasKey) {
-    return res.json({
-      ok: false,
-      model: 'local-pep8-engine',
-      message: isRender
-        ? 'Máy chủ Render chưa có biến môi trường GEMINI_API_KEY hợp lệ trong Render Dashboard > Environment.'
-        : 'Máy chủ AI Studio chưa nhận được GEMINI_API_KEY hợp lệ từ Settings > Secrets (hoặc khóa đang bị trống/sai định dạng).',
-      diagnostic: {
-        httpStatus: null,
-        keyPresent: false,
-        keySource: rawEnvGemini ? 'GEMINI_API_KEY' : (rawEnvGoogle ? 'GOOGLE_API_KEY' : 'NONE'),
-        keyPrefix,
-        geminiKeyLen: rawEnvGemini.length,
-        geminiKeyStartsAIza: rawEnvGemini.startsWith('AIza'),
-        geminiKeyStartsAQ: rawEnvGemini.startsWith('AQ.'),
-      },
-    });
-  }
-
-  let lastError: any = null;
-  const pingSingleModel = async (client: GoogleGenAI, model: string): Promise<string> => {
-    const tryPing = async (useThinking: boolean) => {
-      const modelConfig: any = useThinking && supportsThinkingConfig(model)
-        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-        : undefined;
-      return await withTimeout(
-        client.models.generateContent({
-          model,
-          contents: 'Ping',
-          config: modelConfig,
-        }),
-        12000
-      );
-    };
-
-    try {
-      const response = await tryPing(true);
-      if (response && response.text) return model;
-      throw new Error('Empty response');
-    } catch (e: any) {
-      const status = (e?.status as number) || (e?.statusCode as number);
-      if (status === 400 && supportsThinkingConfig(model) && !isAuthOrPermissionError(e)) {
-        const retryResp = await tryPing(false);
-        if (retryResp && retryResp.text) return model;
-      }
-      throw e;
-    }
-  };
-
-  const pingWithClient = async (client: GoogleGenAI): Promise<{ ok: true; model: string } | { ok: false; err: any }> => {
-    const models = getOrderedCandidateModels();
-    try {
-      const winnerModel = await Promise.any(models.map((m) => pingSingleModel(client, m)));
-      cachedWorkingModel = winnerModel;
-      return { ok: true, model: winnerModel };
-    } catch (aggErr: any) {
-      const errors = Array.isArray(aggErr?.errors) ? aggErr.errors : [aggErr];
-      const authErr = errors.find((e: any) => isAuthOrPermissionError(e));
-      return { ok: false, err: authErr || errors[errors.length - 1] };
-    }
-  };
-
-  const firstAttempt = await pingWithClient(aiClient);
-  if (firstAttempt.ok) {
-    return res.json({
-      ok: true,
-      model: firstAttempt.model,
-      message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${firstAttempt.model})!`,
-    });
-  }
-  lastError = firstAttempt.err;
-
-  let keyVerified = false;
-  let modelsProbeSummary: string | undefined;
-  const serverKey = getServerEnvGeminiKey();
-  if (serverKey) {
-    try {
-      const mRes = await withTimeout(
-        fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(serverKey)}`),
-        5000
-      );
-      keyVerified = mRes.status === 200;
-      modelsProbeSummary = `v1beta/models?key=${mRes.status}`;
-    } catch (e: any) {
-      modelsProbeSummary = `v1beta/models_err:${e?.message || 'err'}`;
+    if (!res.writableEnded) {
+      const fallbackText = analyzeAndFixLocally(effectiveCode, errorText);
+      res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
     }
   }
-
-  // Only probe v1beta generateContent if key is not rejected by auth or models endpoint passed
-  let betaErrorSummary: string | undefined;
-  if (serverKey && preferredApiVersion !== 'v1beta' && (!isAuthOrPermissionError(lastError) || keyVerified)) {
-    const betaClient = createServerGenAiClient(serverKey, 'v1beta');
-    const betaAttempt = await pingWithClient(betaClient);
-    if (betaAttempt.ok) {
-      preferredApiVersion = 'v1beta';
-      ai = betaClient;
-      return res.json({
-        ok: true,
-        model: betaAttempt.model,
-        message: `Trợ lý Google Gemini sẵn sàng trên máy chủ (${betaAttempt.model} • v1beta)!`,
-      });
-    }
-    betaErrorSummary = String(betaAttempt.err?.message || betaAttempt.err || '').slice(0, 200);
-  }
-
-  const errorInfo = extractFriendlyGeminiError(lastError);
-  const redactedRaw = (errorInfo.raw || '')
-    .replace(/AIza[A-Za-z0-9_-]{10,}/g, '[REDACTED_KEY]')
-    .replace(/AQ\.[A-Za-z0-9_.-]{10,}/g, '[REDACTED_KEY]');
-  const rawEnvApiKey = (process.env.API_KEY || '').trim();
-  return res.json({
-    ok: false,
-    model: cachedWorkingModel || CANDIDATE_MODELS[0],
-    message: `${errorInfo.friendly} Ứng dụng không có ô nhập khóa thủ công; bộ phân tích PEP 8 nội bộ vẫn sẵn sàng ngoại tuyến.`,
-    diagnostic: {
-      httpStatus: errorInfo.code ?? null,
-      keyPresent: hasKey,
-      keyVerified,
-      keySource: rawEnvGemini ? 'GEMINI_API_KEY' : (rawEnvGoogle ? 'GOOGLE_API_KEY' : 'NONE'),
-      keyPrefix,
-      geminiKeyLen: rawEnvGemini.length,
-      geminiKeyStartsAIza: rawEnvGemini.startsWith('AIza'),
-      geminiKeyStartsAQ: rawEnvGemini.startsWith('AQ.'),
-      googleKeyLen: rawEnvGoogle.length,
-      apiKeyLen: rawEnvApiKey.length,
-      apiKeyStartsAIza: rawEnvApiKey.startsWith('AIza'),
-      betaErrorSummary: (betaErrorSummary || '').replace(/AIza[A-Za-z0-9_-]{10,}|AQ\.[A-Za-z0-9_.-]{10,}/g, '[REDACTED_KEY]'),
-      modelsProbeSummary,
-      rawError: redactedRaw.slice(0, 350),
-    },
-  });
-});
-
-// REST endpoint: Terminal Diagnostic Logger for client/standalone AI errors
-app.post('/api/ai/diagnostic-log', (req, res) => {
-  const data = req.body || {};
-  printTerminalAiDiagnostic({
-    timestamp: data.timestamp,
-    endpoint: data.endpoint || 'client-request',
-    operation: data.operation || 'Client AI Call',
-    failureType: data.failureType || 'UNKNOWN',
-    httpStatus: data.httpStatus,
-    errorMessage: data.errorMessage || 'No error details provided',
-    keyValidation: data.keyValidation,
-    remediation: data.remediation,
-    source: 'client-terminal-dispatch',
-  });
-  res.status(200).json({ ok: true, logged: true });
 });
 
 // Setup Vite middleware in dev or static files in prod
@@ -3691,14 +3068,9 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve('dist');
-    const indexPath = path.join(distPath, 'index.html');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-      } else {
-        res.status(200).send('<!DOCTYPE html><html><head><title>Pydroid 3 Web</title></head><body>Pydroid 3 Web is running.</body></html>');
-      }
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 

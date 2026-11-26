@@ -162,6 +162,8 @@ export const COMMON_CUSTOM_KEY_SUGGESTIONS = [
   { label: 'input()', insertValue: 'input()', type: 'keyword' as const },
   { label: 'try:', insertValue: 'try:\n    ', type: 'keyword' as const },
   { label: 'except:', insertValue: 'except Exception as e:\n    ', type: 'keyword' as const },
+  { label: 'try/except', insertValue: 'try:\n    pass\nexcept Exception as e:\n    print(f"Lỗi: {e}")\n', type: 'keyword' as const },
+  { label: '__main__', insertValue: 'if __name__ == "__main__":\n    main()\n', type: 'keyword' as const },
   { label: 'break', insertValue: 'break\n', type: 'keyword' as const },
   { label: 'continue', insertValue: 'continue\n', type: 'keyword' as const },
   { label: 'pass', insertValue: 'pass\n', type: 'keyword' as const },
@@ -172,3 +174,112 @@ export const COMMON_CUSTOM_KEY_SUGGESTIONS = [
   { label: 'list()', insertValue: 'list(', type: 'keyword' as const },
   { label: 'f"{}"', insertValue: 'f"{}"', type: 'char' as const },
 ];
+
+export interface BoilerplateSnippet {
+  id: string;
+  title: string;
+  shortLabel: string;
+  category: 'control' | 'structure' | 'loop_io';
+  description: string;
+  code: string;
+}
+
+export const PYTHON_BOILERPLATE_SNIPPETS: BoilerplateSnippet[] = [
+  {
+    id: 'bp_try_except',
+    title: 'try / except',
+    shortLabel: 'try/exc',
+    category: 'control',
+    description: 'Bắt và xử lý ngoại lệ an toàn khi chạy chương trình',
+    code: 'try:\n    pass\nexcept Exception as e:\n    print(f"Lỗi: {e}")\n',
+  },
+  {
+    id: 'bp_main_guard',
+    title: "if __name__ == '__main__':",
+    shortLabel: '__main__',
+    category: 'structure',
+    description: 'Điểm khởi chạy chuẩn của tệp Python',
+    code: 'if __name__ == "__main__":\n    main()\n',
+  },
+  {
+    id: 'bp_def_main',
+    title: 'def main() + __main__',
+    shortLabel: 'main()',
+    category: 'structure',
+    description: 'Khung chương trình đầy đủ gồm hàm main() và khối khởi chạy',
+    code: 'def main():\n    print("Xin chào Python!")\n\n\nif __name__ == "__main__":\n    main()\n',
+  },
+  {
+    id: 'bp_try_except_finally',
+    title: 'try / except / finally',
+    shortLabel: 'try/fin',
+    category: 'control',
+    description: 'Xử lý lỗi kèm khối dọn dẹp tài nguyên luôn được thực thi',
+    code: 'try:\n    pass\nexcept Exception as e:\n    print(f"Lỗi: {e}")\nfinally:\n    pass\n',
+  },
+  {
+    id: 'bp_if_elif_else',
+    title: 'if / elif / else',
+    shortLabel: 'if/elif',
+    category: 'control',
+    description: 'Cấu trúc rẽ nhánh nhiều điều kiện',
+    code: 'if dieu_kien_1:\n    pass\nelif dieu_kien_2:\n    pass\nelse:\n    pass\n',
+  },
+  {
+    id: 'bp_def_func',
+    title: 'def ten_ham(...)',
+    shortLabel: 'def()',
+    category: 'structure',
+    description: 'Định nghĩa hàm Python có docstring và giá trị trả về',
+    code: 'def ten_ham(tham_so):\n    """Mô tả chức năng của hàm."""\n    return tham_so\n',
+  },
+  {
+    id: 'bp_class_init',
+    title: 'class + __init__',
+    shortLabel: 'class',
+    category: 'structure',
+    description: 'Tạo lớp đối tượng với phương thức khởi tạo __init__',
+    code: 'class TenLop:\n    def __init__(self, gia_tri):\n        self.gia_tri = gia_tri\n',
+  },
+  {
+    id: 'bp_with_open',
+    title: 'with open(..., encoding="utf-8")',
+    shortLabel: 'with open',
+    category: 'loop_io',
+    description: 'Đọc tệp văn bản tiếng Việt an toàn và tự động đóng tệp',
+    code: 'with open("du_lieu.txt", "r", encoding="utf-8") as tep:\n    noi_dung = tep.read()\n',
+  },
+  {
+    id: 'bp_for_range',
+    title: 'for i in range(...)',
+    shortLabel: 'for i',
+    category: 'loop_io',
+    description: 'Vòng lặp theo chỉ số từ 0 đến n - 1',
+    code: 'for i in range(10):\n    print(i)\n',
+  },
+  {
+    id: 'bp_for_enumerate',
+    title: 'for i, item in enumerate(...)',
+    shortLabel: 'enum',
+    category: 'loop_io',
+    description: 'Duyệt danh sách lấy đồng thời chỉ số và giá trị',
+    code: 'for chi_so, gia_tri in enumerate(danh_sach):\n    print(chi_so, gia_tri)\n',
+  },
+  {
+    id: 'bp_while_true',
+    title: 'while True + break',
+    shortLabel: 'while',
+    category: 'loop_io',
+    description: 'Vòng lặp liên tục cho menu hoặc kiểm tra dữ liệu nhập',
+    code: 'while True:\n    lenh = input("Nhập (q để thoát): ")\n    if lenh == "q":\n        break\n',
+  },
+  {
+    id: 'bp_list_comp',
+    title: 'List Comprehension',
+    shortLabel: '[x for]',
+    category: 'loop_io',
+    description: 'Tạo và lọc danh sách nhanh trên 1 dòng chuẩn Pythonic',
+    code: 'ket_qua = [x for x in danh_sach if x]\n',
+  },
+];
+

@@ -63,22 +63,7 @@ export const Terminal: React.FC<TerminalProps> = ({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const stdinTextareaRef = useRef<HTMLTextAreaElement>(null);
   const aiSectionRef = useRef<HTMLDivElement>(null);
-  const isComposingRef = useRef(false);
-  const isStdinComposingRef = useRef(false);
-  const lastEmittedStdinRef = useRef<string>(stdinPreset);
-
-  // Sync external stdinPreset changes (e.g. Clear button or loaded lesson sampleInput)
-  useEffect(() => {
-    const el = stdinTextareaRef.current;
-    if (!el || isStdinComposingRef.current) return;
-    if (stdinPreset === lastEmittedStdinRef.current) return;
-    lastEmittedStdinRef.current = stdinPreset;
-    if (el.value !== stdinPreset) {
-      el.value = stdinPreset;
-    }
-  }, [stdinPreset, showStdinDrawer]);
 
   // Check if the user is currently inputting data (typing or input focused)
   const isInputting = isInputFocused || Boolean(currentInput && currentInput.length > 0);
@@ -97,16 +82,58 @@ export const Terminal: React.FC<TerminalProps> = ({
     }
   }, [aiDebugResult, isAiDebugging]);
 
+  // 📱 Tự động cuộn đáy và đưa ô nhập input() lên ngay trên bàn phím ảo điện thoại
+  useEffect(() => {
+    const scrollToLatest = () => {
+      if (scrollContainerRef.current) {
+        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+      }
+      if (isInputFocused && inputRef.current) {
+        inputRef.current.scrollIntoView({ block: 'nearest' });
+      }
+    };
+
+    const container = scrollContainerRef.current;
+    let prevHeight = container?.clientHeight ?? 0;
+    const resizeObserver =
+      container && typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            const nextHeight = container.clientHeight;
+            if (nextHeight > 0 && nextHeight !== prevHeight) {
+              const shrunk = nextHeight < prevHeight - 10;
+              prevHeight = nextHeight;
+              if (shrunk || isInputFocused) {
+                requestAnimationFrame(scrollToLatest);
+              }
+            }
+          })
+        : null;
+
+    if (container && resizeObserver) {
+      resizeObserver.observe(container);
+    }
+
+    window.addEventListener('resize', scrollToLatest);
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      window.visualViewport.addEventListener('resize', scrollToLatest);
+      window.visualViewport.addEventListener('scroll', scrollToLatest);
+    }
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', scrollToLatest);
+      if (typeof window !== 'undefined' && window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', scrollToLatest);
+        window.visualViewport.removeEventListener('scroll', scrollToLatest);
+      }
+    };
+  }, [isInputFocused]);
+
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    isComposingRef.current = false;
-    const liveValue = inputRef.current ? inputRef.current.value : currentInput;
-    if (!liveValue && !isRunning) return;
+    if (!currentInput && !isRunning) return;
 
-    onSendStdin(liveValue);
-    if (inputRef.current) {
-      inputRef.current.value = '';
-    }
+    onSendStdin(currentInput);
     setCurrentInput('');
   };
 
@@ -114,6 +141,18 @@ export const Terminal: React.FC<TerminalProps> = ({
   const visibleEntries = entries.filter((e) => {
     const text = e.text || '';
     const lower = text.toLowerCase().trim();
+
+    // 0. Always preserve diagnostic test logs
+    if (
+      lower.includes('gemini') ||
+      lower.includes('chẩn đoán') ||
+      lower.includes('diagnostic') ||
+      lower.includes('pydroid 3 -') ||
+      lower.includes('[bước') ||
+      lower.includes('báo cáo')
+    ) {
+      return true;
+    }
 
     // 1. Filter out Python internal path / standard library install diagnostics
     if (
@@ -220,9 +259,21 @@ export const Terminal: React.FC<TerminalProps> = ({
   };
 
   return (
-    <div className="flex-1 w-full h-full flex flex-col bg-[#0b0c13] text-[#f8fafc] overflow-hidden font-mono select-text">
-      {/* Terminal Slim Header: Tối ưu không gian để vùng hiển thị Terminal lớn nhất */}
-      <div className="h-8 bg-[#13141f] border-b border-[#232435] px-3 flex items-center justify-between text-xs shrink-0 select-none">
+    <div
+      className="flex-1 min-h-0 w-full h-full flex flex-col overflow-hidden font-mono select-text"
+      style={{
+        backgroundColor: 'var(--ui-bg)',
+        color: 'var(--ui-text)',
+      }}
+    >
+      {/* Terminal Slim Header */}
+      <div
+        className="h-8 px-3 flex items-center justify-between text-xs shrink-0 select-none"
+        style={{
+          background: 'var(--ui-bar-gradient)',
+          borderBottom: '1px solid var(--ui-border)',
+        }}
+      >
         <div className="flex items-center space-x-2">
           <span className="flex items-center space-x-1.5 font-bold text-gray-200">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -255,17 +306,27 @@ export const Terminal: React.FC<TerminalProps> = ({
           {/* STDIN Drawer Toggle */}
           <button
             onClick={() => setShowStdinDrawer(!showStdinDrawer)}
-            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-xs transition border cursor-pointer ${
+            className="flex items-center space-x-1 px-2 py-0.5 rounded text-xs transition cursor-pointer hover:brightness-125"
+            style={
               showStdinDrawer || stdinPreset.trim()
-                ? 'bg-amber-950/60 border-amber-500/60 text-amber-300 font-bold'
-                : 'bg-[#1f202e] border-[#313248] text-gray-300 hover:bg-[#2b2c40]'
-            }`}
+                ? {
+                    backgroundColor: 'var(--ui-accent-soft)',
+                    border: '1px solid var(--ui-border-strong)',
+                    color: 'var(--ui-accent)',
+                    fontWeight: 700,
+                  }
+                : {
+                    backgroundColor: 'var(--ui-surface-2)',
+                    border: '1px solid var(--ui-border)',
+                    color: 'var(--ui-text-muted)',
+                  }
+            }
             title="Ngăn nhập trước dữ liệu STDIN cho các bài toán nhiều input"
           >
-            <FileText className="w-3 h-3 text-amber-400" />
+            <FileText className="w-3 h-3" style={{ color: 'var(--ui-accent)' }} />
             <span>STDIN</span>
             {stdinPreset.trim() && (
-              <span className="w-1.5 h-1.5 bg-amber-400 rounded-full" />
+              <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--ui-accent)' }} />
             )}
             {showStdinDrawer ? (
               <ChevronUp className="w-3 h-3 ml-0.5" />
@@ -286,10 +347,34 @@ export const Terminal: React.FC<TerminalProps> = ({
             </button>
           )}
 
+          {/* AI Diagnostic Button */}
+          <button
+            onClick={() => {
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('pydroid:run-gemini-diagnostic'));
+              }
+            }}
+            className="flex items-center space-x-1 px-2 py-0.5 rounded text-xs transition cursor-pointer hover:brightness-125"
+            style={{
+              backgroundColor: 'var(--ui-surface-2)',
+              border: '1px solid var(--ui-border)',
+              color: 'var(--ui-accent)',
+            }}
+            title="Kiểm tra kết nối và xác thực toàn diện Gemini API"
+          >
+            <Sparkles className="w-3 h-3" style={{ color: 'var(--ui-accent)' }} />
+            <span className="hidden sm:inline">Chẩn đoán AI</span>
+          </button>
+
           {/* Clear Button */}
           <button
             onClick={onClear}
-            className="p-1 bg-[#1f202e] hover:bg-[#2b2c40] text-gray-300 hover:text-white rounded border border-[#313248] transition cursor-pointer"
+            className="p-1 rounded transition cursor-pointer hover:brightness-125"
+            style={{
+              backgroundColor: 'var(--ui-surface-2)',
+              border: '1px solid var(--ui-border)',
+              color: 'var(--ui-text-muted)',
+            }}
             title="Xóa sạch màn hình Terminal"
           >
             <RotateCcw className="w-3 h-3" />
@@ -344,9 +429,15 @@ export const Terminal: React.FC<TerminalProps> = ({
 
       {/* STDIN Drawer: Pre-configured multi-line input */}
       {showStdinDrawer && (
-        <div className="bg-[#181926] border-b border-[#2b2c3d] p-2.5 shrink-0 transition-all select-none">
-          <div className="flex items-center justify-between mb-1.5 text-xs text-gray-200">
-            <span className="font-semibold text-amber-300 flex items-center space-x-1">
+        <div
+          className="p-2.5 shrink-0 transition-all select-none"
+          style={{
+            backgroundColor: 'var(--ui-surface)',
+            borderBottom: '1px solid var(--ui-border)',
+          }}
+        >
+          <div className="flex items-center justify-between mb-1.5 text-xs">
+            <span className="font-semibold flex items-center space-x-1" style={{ color: 'var(--ui-accent)' }}>
               <span>📥 Ngăn dữ liệu STDIN nạp sẵn (Mỗi dòng một giá trị):</span>
             </span>
             <button
@@ -357,40 +448,16 @@ export const Terminal: React.FC<TerminalProps> = ({
             </button>
           </div>
           <textarea
-            ref={stdinTextareaRef}
-            lang="vi"
-            defaultValue={stdinPreset}
-            onChange={(e) => {
-              if (isStdinComposingRef.current || (e.nativeEvent as InputEvent)?.isComposing) return;
-              const val = e.target.value;
-              lastEmittedStdinRef.current = val;
-              setStdinPreset(val);
-            }}
-            onCompositionStart={() => {
-              isStdinComposingRef.current = true;
-            }}
-            onCompositionEnd={(e) => {
-              isStdinComposingRef.current = false;
-              const val = e.currentTarget.value;
-              lastEmittedStdinRef.current = val;
-              setStdinPreset(val);
-            }}
-            onBlur={(e) => {
-              isStdinComposingRef.current = false;
-              const val = e.currentTarget.value;
-              if (val !== lastEmittedStdinRef.current) {
-                lastEmittedStdinRef.current = val;
-                setStdinPreset(val);
-              }
-            }}
+            value={stdinPreset}
+            onChange={(e) => setStdinPreset(e.target.value)}
             placeholder="Ví dụ:&#10;Nguyễn Văn An&#10;25&#10;1.75"
             rows={3}
-            spellCheck={false}
-            autoCapitalize="none"
-            autoCorrect="on"
-            autoComplete="on"
-            inputMode="text"
-            className="w-full bg-[#0f1018] border border-[#33344a] rounded p-2 text-xs font-mono text-[#f8fafc] focus:outline-none focus:border-amber-400 transition select-text"
+            className="w-full rounded p-2 text-xs font-mono focus:outline-none transition"
+            style={{
+              backgroundColor: 'var(--ui-inset)',
+              border: '1px solid var(--ui-border)',
+              color: 'var(--ui-text)',
+            }}
           />
         </div>
       )}
@@ -398,7 +465,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       {/* 🚀 Output Stream Canvas: Bắt đầu ngay dòng trên cùng, chữ sáng rõ nét */}
       <div
         ref={scrollContainerRef}
-        className="flex-1 px-3 pt-1 pb-3 sm:px-4 sm:pt-1 sm:pb-4 overflow-y-auto overflow-x-auto text-sm leading-relaxed space-y-1 font-mono selection:bg-amber-400 selection:text-black"
+        className="flex-1 min-h-0 px-3 pt-1 pb-3 sm:px-4 sm:pt-1 sm:pb-4 overflow-y-auto overflow-x-auto ide-scroll-y text-sm leading-relaxed space-y-1 font-mono selection:bg-amber-400 selection:text-black"
       >
         {visibleEntries.length === 0 && !executionResult ? (
           <div className="text-gray-400 italic pt-1 select-none font-sans text-xs">
@@ -666,72 +733,68 @@ export const Terminal: React.FC<TerminalProps> = ({
         <div ref={bottomRef} />
       </div>
 
-      {/* Interactive Bottom Input Bar (Glowing Amber when awaiting input) */}
+      {/* Interactive Bottom Input Bar (Glowing with theme accent when awaiting input) */}
       <div
-        className={`p-2 bg-[#12131d] border-t transition-all ${
-          isRunning
-            ? 'border-amber-400/90 shadow-[0_-3px_15px_rgba(251,191,36,0.2)] ring-1 ring-amber-400/50'
-            : 'border-[#262738]'
-        }`}
+        className="shrink-0 p-2 transition-all"
+        style={{
+          background: 'var(--ui-bar-gradient)',
+          borderTop: isRunning ? '1px solid var(--ui-accent)' : '1px solid var(--ui-border)',
+          boxShadow: isRunning ? 'var(--ui-accent-glow)' : 'none',
+        }}
       >
         <form onSubmit={handleSend} className="flex items-center space-x-2">
-          <div className="text-amber-400 font-bold text-xs select-none pl-1">
+          <div className="font-bold text-xs select-none pl-1" style={{ color: 'var(--ui-accent)' }}>
             &gt;&gt;&gt;
           </div>
           <input
             ref={inputRef}
-            lang="vi"
             type="text"
-            defaultValue=""
-            onChange={(e) => {
-              if (isComposingRef.current || (e.nativeEvent as InputEvent)?.isComposing) return;
-              setCurrentInput(e.target.value);
+            value={currentInput}
+            onChange={(e) => setCurrentInput(e.target.value)}
+            onFocus={() => {
+              setIsInputFocused(true);
+              const syncBottom = () => {
+                if (scrollContainerRef.current) {
+                  scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+                }
+                inputRef.current?.scrollIntoView({ block: 'nearest' });
+              };
+              requestAnimationFrame(syncBottom);
+              setTimeout(syncBottom, 160);
+              setTimeout(syncBottom, 360);
             }}
-            onFocus={() => setIsInputFocused(true)}
-            onBlur={(e) => {
-              isComposingRef.current = false;
-              setCurrentInput(e.currentTarget.value);
-              setIsInputFocused(false);
-            }}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
-            }}
-            onCompositionEnd={(e) => {
-              isComposingRef.current = false;
-              setCurrentInput(e.currentTarget.value);
-            }}
-            onKeyDown={(e) => {
-              if (
-                e.key === 'Enter' &&
-                (e.nativeEvent.isComposing || isComposingRef.current || e.keyCode === 229)
-              ) {
-                e.preventDefault();
-              }
-            }}
-            spellCheck={false}
-            autoCapitalize="none"
-            autoCorrect="on"
-            autoComplete="on"
-            inputMode="text"
+            onBlur={() => setIsInputFocused(false)}
             placeholder={
               isRunning
                 ? 'Nhập dữ liệu cho input() rồi bấm Gửi (hoặc Enter)...'
                 : 'Nhập lệnh hoặc tham số vào đây...'
             }
-            className="flex-1 bg-[#181926] text-[#fef08a] text-sm px-3.5 py-2 rounded-lg border border-[#34354c] focus:outline-none focus:border-amber-400 font-mono transition select-text"
+            className="flex-1 text-sm px-3.5 py-2 rounded-lg focus:outline-none font-mono transition"
             style={{
-              userSelect: 'text',
-              WebkitUserSelect: 'text',
+              backgroundColor: 'var(--ui-inset)',
+              border: '1px solid var(--ui-border)',
+              color: 'var(--ui-accent)',
             }}
           />
           <button
             type="submit"
             disabled={!isRunning && !currentInput}
             className={`flex items-center space-x-1 px-3.5 py-2 rounded-lg text-xs font-bold transition active:scale-95 ${
-              isRunning || currentInput
-                ? 'bg-amber-400 hover:bg-amber-300 text-black shadow-md cursor-pointer'
-                : 'bg-[#222332] text-gray-500 cursor-not-allowed'
+              isRunning || currentInput ? 'cursor-pointer hover:brightness-110' : 'cursor-not-allowed opacity-50'
             }`}
+            style={
+              isRunning || currentInput
+                ? {
+                    background: 'linear-gradient(135deg, var(--ui-accent) 0%, var(--ui-accent-strong) 100%)',
+                    color: 'var(--ui-accent-contrast)',
+                    boxShadow: 'var(--ui-accent-glow)',
+                  }
+                : {
+                    backgroundColor: 'var(--ui-surface-2)',
+                    color: 'var(--ui-text-muted)',
+                    border: '1px solid var(--ui-border)',
+                  }
+            }
           >
             <span>Gửi</span>
             <Send className="w-3.5 h-3.5" />

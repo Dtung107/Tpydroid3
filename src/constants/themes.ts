@@ -1,6 +1,119 @@
-import { SyntaxColors } from '../types';
+import { SyntaxColors, UiTheme } from '../types';
+
+export interface UiThemeDefinition {
+  id: UiTheme;
+  name: string;
+  subtitle: string;
+  description: string;
+  badge: string;
+  preview: {
+    bg: string;
+    bar: string;
+    surface: string;
+    border: string;
+    accent: string;
+    accent2: string;
+    glow: string;
+  };
+}
+
+export const UI_THEMES: UiThemeDefinition[] = [
+  {
+    id: 'midnight-obsidian',
+    name: 'Midnight Obsidian',
+    subtitle: 'Đen sâu • Vàng kim loại • Xanh dương lạnh',
+    description: 'Màu đen sâu sang trọng, viền sáng mỏng tinh xảo kết hợp vàng kim loại và xanh dương lạnh chuyên nghiệp.',
+    badge: 'Executive',
+    preview: {
+      bg: '#07090e',
+      bar: '#0b0f18',
+      surface: '#101522',
+      border: 'rgba(148, 179, 219, 0.35)',
+      accent: '#e2be53',
+      accent2: '#63a4ff',
+      glow: '0 0 14px rgba(226, 190, 83, 0.32)',
+    },
+  },
+  {
+    id: 'neon-noir',
+    name: 'Neon Noir Luxury',
+    subtitle: 'Đen tuyền • Neon tím-hồng • Xanh cyan',
+    description: 'Nền đen tuyền huyền bí kết hợp ánh sáng neon tím-hồng và xanh cyan rực rỡ theo phong cách cyber-luxury.',
+    badge: 'Cyber-Lux',
+    preview: {
+      bg: '#030307',
+      bar: '#070610',
+      surface: '#0e0b1b',
+      border: 'rgba(232, 121, 249, 0.45)',
+      accent: '#e879f9',
+      accent2: '#22d3ee',
+      glow: '0 0 16px rgba(232, 121, 249, 0.45)',
+    },
+  },
+  {
+    id: 'graphite-gold',
+    name: 'Graphite Gold Elite',
+    subtitle: 'Xám đen graphite • Vàng champagne kim loại',
+    description: 'Tông xám đen graphite tối giản kết hợp vàng champagne kim loại ấm áp, chuẩn mực thượng lưu.',
+    badge: 'Minimal Elite',
+    preview: {
+      bg: '#121316',
+      bar: '#17191d',
+      surface: '#1d2025',
+      border: 'rgba(226, 199, 146, 0.32)',
+      accent: '#e2c792',
+      accent2: '#cbd5e1',
+      glow: '0 0 12px rgba(226, 199, 146, 0.25)',
+    },
+  },
+];
 
 export const THEME_PALETTES: Record<string, SyntaxColors> = {
+  'midnight-obsidian': {
+    keyword: '#e8c55a',      // metallic gold
+    builtin: '#6cb6ff',      // cool steel blue
+    string: '#8fd4e8',       // icy blue
+    number: '#f3d479',       // warm gold
+    comment: '#64748b',      // crisp slate
+    function: '#7dc4ff',     // azure highlight
+    variable: '#edf2f7',     // alabaster white
+    operator: '#d4af37',     // antique gold
+    background: '#07090e',   // deep obsidian
+    foreground: '#e2e8f0',
+    lineHighlight: '#111726',
+    gutterBg: '#05070b',
+    gutterFg: '#4e5d73',
+  },
+  'neon-noir': {
+    keyword: '#f43f9c',      // neon magenta-pink
+    builtin: '#22d3ee',      // electric cyan
+    string: '#67e8f9',       // luminous ice cyan
+    number: '#c084fc',       // neon orchid violet
+    comment: '#6f658c',      // muted twilight
+    function: '#e879f9',     // neon fuchsia
+    variable: '#f5f3ff',     // pure pearl
+    operator: '#38bdf8',     // crisp cyan
+    background: '#030307',   // pitch noir
+    foreground: '#f1ecff',
+    lineHighlight: '#130c23',
+    gutterBg: '#020205',
+    gutterFg: '#6c4d8f',
+  },
+  'graphite-gold': {
+    keyword: '#e2c792',      // champagne gold
+    builtin: '#cbd5e1',      // brushed platinum
+    string: '#a8ccb8',       // muted sage champagne
+    number: '#d8ad78',       // warm bronze-gold
+    comment: '#6e737d',      // graphite muted
+    function: '#f3dfb6',     // pale champagne
+    variable: '#f3f1ec',     // warm ivory
+    operator: '#c9a96e',     // satin gold
+    background: '#121316',   // matte graphite
+    foreground: '#eceae4',
+    lineHighlight: '#1d1f24',
+    gutterBg: '#0e0f12',
+    gutterFg: '#616670',
+  },
   'pydroid-dark': {
     keyword: '#ff7b72',      // warm red-orange
     builtin: '#79c0ff',      // soft blue

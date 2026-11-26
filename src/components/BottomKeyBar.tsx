@@ -753,11 +753,6 @@ export const BottomKeyBar: React.FC<BottomKeyBarProps> = ({
                         </label>
                         <input
                           type="text"
-                          lang="vi"
-                          spellCheck={false}
-                          autoCapitalize="none"
-                          autoCorrect="on"
-                          autoComplete="on"
                           value={newKeyLabel}
                           onChange={(e) => {
                             setNewKeyLabel(e.target.value);
@@ -765,7 +760,7 @@ export const BottomKeyBar: React.FC<BottomKeyBarProps> = ({
                           }}
                           placeholder="Ví dụ: len(), try:, range()"
                           maxLength={12}
-                          className="w-full px-2.5 py-1.5 bg-[#201f2e] border border-[#3a3854] rounded-lg text-white font-mono text-xs focus:outline-none focus:border-amber-400 select-text"
+                          className="w-full px-2.5 py-1.5 bg-[#201f2e] border border-[#3a3854] rounded-lg text-white font-mono text-xs focus:outline-none focus:border-amber-400"
                           required
                         />
                       </div>
@@ -775,15 +770,10 @@ export const BottomKeyBar: React.FC<BottomKeyBarProps> = ({
                         </label>
                         <input
                           type="text"
-                          lang="vi"
-                          spellCheck={false}
-                          autoCapitalize="none"
-                          autoCorrect="on"
-                          autoComplete="on"
                           value={newKeyInsert}
                           onChange={(e) => setNewKeyInsert(e.target.value)}
                           placeholder="Ví dụ: len( hoặc try:\n    "
-                          className="w-full px-2.5 py-1.5 bg-[#201f2e] border border-[#3a3854] rounded-lg text-white font-mono text-xs focus:outline-none focus:border-amber-400 select-text"
+                          className="w-full px-2.5 py-1.5 bg-[#201f2e] border border-[#3a3854] rounded-lg text-white font-mono text-xs focus:outline-none focus:border-amber-400"
                           required
                         />
                       </div>
@@ -847,15 +837,10 @@ export const BottomKeyBar: React.FC<BottomKeyBarProps> = ({
                     <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-2" />
                     <input
                       type="text"
-                      lang="vi"
-                      spellCheck={false}
-                      autoCapitalize="none"
-                      autoCorrect="on"
-                      autoComplete="on"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
                       placeholder="Tìm phím nhanh..."
-                      className="w-full pl-8 pr-2.5 py-1.5 bg-[#171624] border border-[#313047] rounded-lg text-gray-200 text-xs focus:outline-none focus:border-amber-400 select-text"
+                      className="w-full pl-8 pr-2.5 py-1.5 bg-[#171624] border border-[#313047] rounded-lg text-gray-200 text-xs focus:outline-none focus:border-amber-400"
                     />
                   </div>
 

@@ -1,398 +1,248 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import {
   getAuth,
+  initializeAuth,
+  indexedDBLocalPersistence,
+  browserLocalPersistence,
+  browserSessionPersistence,
+  browserPopupRedirectResolver,
   signInWithPopup,
-  signInWithCredential,
   GoogleAuthProvider,
   onAuthStateChanged,
+  Auth,
   User,
-  type Auth,
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
-import {
-  getApiBaseUrl,
-  isAndroidApkEnvironment,
-  RENDER_CLOUD_API_URL,
-  DEFAULT_CLOUD_API_URL,
-} from './apiConfig';
 
-export const SCOPES = [
-  'https://www.googleapis.com/auth/userinfo.profile',
-  'https://www.googleapis.com/auth/userinfo.email',
+export const DEFAULT_RENDER_BACKEND_URL = 'https://pydroid3-android.onrender.com';
+const RENDER_BACKEND_STORAGE_KEY = 'pydroid_render_backend_url';
+
+export const GOOGLE_WORKSPACE_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.appdata',
+  'https://www.googleapis.com/auth/tasks',
 ];
 
-let auth: Auth | null = null;
-try {
-  const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-  auth = getAuth(app);
-} catch (err) {
-  console.warn('Firebase Auth init skipped:', err);
-}
-export { auth };
-
-const provider = new GoogleAuthProvider();
-SCOPES.forEach((scope) => provider.addScope(scope));
-provider.setCustomParameters({ prompt: 'select_account' });
-
-// Flag to indicate if we are in the middle of a sign-in flow.
-let isSigningIn = false;
-// Cache the access token & APK bridge user strictly in memory (never localStorage/sessionStorage).
-let cachedAccessToken: string | null = null;
-let cachedApkUser: User | null = null;
-
-type AuthCallbacks = {
-  onAuthSuccess?: (user: User, token: string | null) => void;
-  onAuthSignedOutOrNeedsToken?: (user: User | null) => void;
-};
-
-let activeCallbacks: AuthCallbacks = {};
-
-let pendingApkResolve: ((val: { user: User; accessToken: string } | null) => void) | null = null;
-let pendingApkReject: ((err: Error) => void) | null = null;
-let pendingApkTimer: ReturnType<typeof setTimeout> | null = null;
-
-function clearPendingApkPromise() {
-  if (pendingApkTimer) {
-    clearTimeout(pendingApkTimer);
-    pendingApkTimer = null;
-  }
-  pendingApkResolve = null;
-  pendingApkReject = null;
+export interface GoogleAccountProfile {
+  uid: string;
+  displayName: string;
+  email: string;
+  photoURL: string;
 }
 
-function getCapacitorPlugin<T = any>(name: string): T | null {
+export function getRenderBackendUrl(): string {
   try {
-    if (typeof window === 'undefined') return null;
-    return ((window as any).Capacitor?.Plugins?.[name] as T) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-async function fetchGoogleUserProfile(accessToken: string, fallback: {
-  name?: string;
-  email?: string;
-  photo?: string;
-}): Promise<User> {
-  let name = fallback.name || '';
-  let email = fallback.email || '';
-  let photo = fallback.photo || '';
-  let sub = '';
-
-  try {
-    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (res.ok) {
-      const info = await res.json();
-      name = info.name || name;
-      email = info.email || email;
-      photo = info.picture || photo;
-      sub = info.sub || '';
-    }
-  } catch (_) {
-    // Fallback cleanly to deep-link metadata
-  }
-
-  return {
-    uid: sub || `google_${email || Date.now()}`,
-    displayName: name || email || 'Người dùng Google',
-    email: email || null,
-    photoURL: photo || null,
-    emailVerified: true,
-    isAnonymous: false,
-    providerId: 'google.com',
-  } as unknown as User;
-}
-
-async function handleApkOAuthCallbackUrl(rawUrl: string): Promise<boolean> {
-  if (!rawUrl || !rawUrl.startsWith('com.pydroid3.webide://oauth')) {
-    return false;
-  }
-
-  const browserPlugin = getCapacitorPlugin<{ close?: () => Promise<void> }>('Browser');
-  try {
-    if (browserPlugin?.close) {
-      await Promise.resolve(browserPlugin.close());
+    const saved = localStorage.getItem(RENDER_BACKEND_STORAGE_KEY);
+    if (saved && saved.trim()) {
+      return saved.trim().replace(/\/+$/, '');
     }
   } catch (_) {}
+  return DEFAULT_RENDER_BACKEND_URL;
+}
 
-  const hashPart = rawUrl.includes('#') ? rawUrl.split('#')[1] : rawUrl.split('?')[1] || '';
-  const params = new URLSearchParams(hashPart);
-  const oauthError = params.get('error');
-  if (oauthError) {
-    const err = new Error(decodeURIComponent(oauthError));
-    isSigningIn = false;
-    if (pendingApkReject) {
-      const reject = pendingApkReject;
-      clearPendingApkPromise();
-      reject(err);
+export function setRenderBackendUrl(url: string): string {
+  const clean = url.trim().replace(/\/+$/, '');
+  try {
+    if (clean) {
+      localStorage.setItem(RENDER_BACKEND_STORAGE_KEY, clean);
+    } else {
+      localStorage.removeItem(RENDER_BACKEND_STORAGE_KEY);
     }
-    return true;
-  }
+  } catch (_) {}
+  return clean || DEFAULT_RENDER_BACKEND_URL;
+}
 
-  const accessToken = params.get('access_token') || '';
-  const idToken = params.get('id_token') || '';
-  if (!accessToken) {
-    const err = new Error('Không nhận được mã truy cập Google từ trình duyệt Chrome.');
-    isSigningIn = false;
-    if (pendingApkReject) {
-      const reject = pendingApkReject;
-      clearPendingApkPromise();
-      reject(err);
-    }
-    return true;
-  }
+export function isRunningInsideNativeApk(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    window.location.protocol === 'capacitor:' ||
+    (window as any).AndroidFileBridge !== undefined ||
+    ((window as any).Capacitor !== undefined &&
+      typeof (window as any).Capacitor?.isNativePlatform === 'function' &&
+      (window as any).Capacitor.isNativePlatform())
+  );
+}
 
-  cachedAccessToken = accessToken;
-  let signedUser: User | null = null;
-
-  if (idToken && auth) {
-    try {
-      const cred = GoogleAuthProvider.credential(idToken, accessToken);
-      const userCred = await signInWithCredential(auth, cred);
-      signedUser = userCred.user;
-    } catch (_) {
-      // Fallback to in-memory Google profile if localhost is not yet allowlisted in Firebase Console
-    }
-  }
-
-  if (!signedUser) {
-    signedUser = await fetchGoogleUserProfile(accessToken, {
-      name: params.get('name') || '',
-      email: params.get('email') || '',
-      photo: params.get('photo') || '',
+// Reuse existing Firebase app if already initialized.
+// Use initializeAuth WITHOUT eager popupRedirectResolver at startup so mobile/iframe/APK environments
+// do not proactively open and timeout on hidden __/auth/iframe pings during boot.
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+function createFirebaseAuth(firebaseApp: FirebaseApp): Auth {
+  try {
+    return initializeAuth(firebaseApp, {
+      persistence: [
+        indexedDBLocalPersistence,
+        browserLocalPersistence,
+        browserSessionPersistence,
+      ],
     });
-    cachedApkUser = signedUser;
-  } else {
-    cachedApkUser = null;
+  } catch {
+    return getAuth(firebaseApp);
   }
-
-  isSigningIn = false;
-  activeCallbacks.onAuthSuccess?.(signedUser, cachedAccessToken);
-
-  if (pendingApkResolve) {
-    const resolve = pendingApkResolve;
-    clearPendingApkPromise();
-    resolve({ user: signedUser, accessToken: cachedAccessToken });
-  }
-  return true;
 }
+const auth = createFirebaseAuth(app);
 
-/**
- * Initialize auth state listener & Capacitor Deep-Link callback listener. Call on app load.
- */
-export const initAuth = (
-  onAuthSuccess?: (user: User, token: string | null) => void,
-  onAuthSignedOutOrNeedsToken?: (user: User | null) => void
-) => {
-  activeCallbacks = { onAuthSuccess, onAuthSignedOutOrNeedsToken };
+const provider = new GoogleAuthProvider();
+for (const scope of GOOGLE_WORKSPACE_SCOPES) {
+  provider.addScope(scope);
+}
+provider.setCustomParameters({
+  prompt: 'select_account',
+});
 
-  let unsubscribeFirebase: () => void = () => {};
-  if (auth) {
-    try {
-      unsubscribeFirebase = onAuthStateChanged(auth, (user: User | null) => {
-        const effectiveUser = user || cachedApkUser;
-        if (effectiveUser) {
-          if (cachedAccessToken) {
-            onAuthSuccess?.(effectiveUser, cachedAccessToken);
-          } else if (!isSigningIn) {
-            cachedAccessToken = null;
-            onAuthSignedOutOrNeedsToken?.(effectiveUser);
-          }
-        } else {
-          cachedAccessToken = null;
-          onAuthSignedOutOrNeedsToken?.(null);
-        }
-      });
-    } catch (err) {
-      console.warn('onAuthStateChanged failed:', err);
-    }
-  }
+// In-memory only cache (NEVER stored in localStorage or sessionStorage)
+let isSigningIn = false;
+let cachedAccessToken: string | null = null;
+let cachedProfile: GoogleAccountProfile | null = null;
+const authListeners = new Set<
+  (profile: GoogleAccountProfile | null, token: string | null) => void
+>();
 
-  let appListenerHandle: { remove?: () => Promise<void> | void } | null = null;
-  const appPlugin = getCapacitorPlugin<{
-    addListener?: (
-      eventName: string,
-      listenerFunc: (data: { url?: string }) => void
-    ) => Promise<{ remove: () => Promise<void> }> | { remove: () => Promise<void> };
-    getLaunchUrl?: () => Promise<{ url?: string } | undefined>;
-  }>('App');
-
-  if (appPlugin && typeof appPlugin.addListener === 'function') {
-    try {
-      // Capacitor native-bridge.js returns { remove } synchronously (not a Promise),
-      // while @capacitor/app JS wrapper returns a Promise<PluginListenerHandle>. Handle both!
-      const handleOrPromise = appPlugin.addListener('appUrlOpen', (data) => {
-        if (data?.url) {
-          handleApkOAuthCallbackUrl(data.url).catch(() => {});
-        }
-      });
-      if (handleOrPromise && typeof (handleOrPromise as any).then === 'function') {
-        (handleOrPromise as Promise<{ remove?: () => Promise<void> }>)
-          .then((handle) => {
-            if (handle) appListenerHandle = handle;
-          })
-          .catch(() => {});
-      } else if (handleOrPromise && typeof (handleOrPromise as any).remove === 'function') {
-        appListenerHandle = handleOrPromise as { remove?: () => Promise<void> };
-      }
-    } catch (err) {
-      console.warn('Capacitor App.addListener skipped:', err);
-    }
-  }
-
-  if (appPlugin && typeof appPlugin.getLaunchUrl === 'function') {
-    try {
-      Promise.resolve(appPlugin.getLaunchUrl())
-        .then((res) => {
-          if (res?.url) {
-            handleApkOAuthCallbackUrl(res.url).catch(() => {});
-          }
-        })
-        .catch(() => {});
-    } catch (_) {}
-  }
-
-  return () => {
-    try {
-      unsubscribeFirebase();
-    } catch (_) {}
-    try {
-      Promise.resolve(appListenerHandle?.remove?.()).catch(() => {});
-    } catch (_) {}
+function toProfile(user: User): GoogleAccountProfile {
+  return {
+    uid: user.uid,
+    displayName: user.displayName || user.email || 'Người dùng Google',
+    email: user.email || '',
+    photoURL: user.photoURL || '',
   };
-};
-
-/**
- * Web-only Firebase popup sign-in helper used both on standard Web and the APK Chrome Custom Tab bridge (?apk_oauth=1).
- */
-export const runWebPopupForApkBridge = async (): Promise<{
-  user: User;
-  accessToken: string;
-  idToken: string;
-}> => {
-  if (!auth) {
-    throw new Error('Firebase Authentication chưa sẵn sàng.');
-  }
-  isSigningIn = true;
-  try {
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Không nhận được quyền truy cập Google từ cửa sổ đăng nhập.');
-    }
-    cachedAccessToken = credential.accessToken;
-    return {
-      user: result.user,
-      accessToken: credential.accessToken,
-      idToken: credential.idToken || '',
-    };
-  } finally {
-    isSigningIn = false;
-  }
-};
-
-function getApkBridgeBaseUrl(): string {
-  const configured = getApiBaseUrl();
-  if (configured && configured.startsWith('https://')) {
-    return configured;
-  }
-  return RENDER_CLOUD_API_URL || DEFAULT_CLOUD_API_URL;
 }
 
-/**
- * Sign in with Google:
- * - On Web Chrome: standard Firebase popup.
- * - On Android APK: opens Chrome Custom Tab bridge (?apk_oauth=1) to bypass WebView disallowed_useragent and returns via com.pydroid3.webide://oauth#...
- */
-export const googleSignIn = async (): Promise<{
-  user: User;
-  accessToken: string;
-} | null> => {
-  if (isAndroidApkEnvironment()) {
-    const browserPlugin = getCapacitorPlugin<{
-      open?: (opts: { url: string; presentationStyle?: string }) => Promise<void>;
-    }>('Browser');
-    const appPlugin = getCapacitorPlugin('App');
-    const bridgeUrl = `${getApkBridgeBaseUrl()}/?apk_oauth=1`;
+function notifyAuthListeners() {
+  for (const cb of authListeners) {
+    try {
+      cb(cachedProfile, cachedAccessToken);
+    } catch (_) {}
+  }
+}
 
-    if (browserPlugin?.open && appPlugin) {
-      isSigningIn = true;
-      clearPendingApkPromise();
+export function subscribeGoogleAuth(
+  cb: (profile: GoogleAccountProfile | null, token: string | null) => void
+): () => void {
+  authListeners.add(cb);
+  cb(cachedProfile, cachedAccessToken);
+  return () => {
+    authListeners.delete(cb);
+  };
+}
 
-      return new Promise(async (resolve, reject) => {
-        pendingApkResolve = resolve;
-        pendingApkReject = reject;
-        pendingApkTimer = setTimeout(() => {
-          if (pendingApkReject) {
-            isSigningIn = false;
-            const r = pendingApkReject;
-            clearPendingApkPromise();
-            r(new Error('Quá thời gian chờ đăng nhập từ trình duyệt Chrome. Nếu bạn đã đăng nhập trên Chrome, hãy nhấn nút "Quay lại ứng dụng Pydroid 3" trên Chrome hoặc thử lại.'));
-          }
-        }, 180000);
-
-        try {
-          await browserPlugin.open!({ url: bridgeUrl });
-        } catch (openErr: any) {
-          isSigningIn = false;
-          clearPendingApkPromise();
-          reject(new Error(openErr?.message || 'Không thể mở Chrome Custom Tabs để đăng nhập Google.'));
-        }
-      });
+export const initAuth = (
+  onAuthSuccess?: (profile: GoogleAccountProfile, token: string) => void,
+  onAuthFailure?: () => void
+) => {
+  return onAuthStateChanged(auth, async (user: User | null) => {
+    if (user) {
+      cachedProfile = toProfile(user);
+      if (cachedAccessToken) {
+        if (onAuthSuccess) onAuthSuccess(cachedProfile, cachedAccessToken);
+        notifyAuthListeners();
+      } else if (!isSigningIn) {
+        cachedAccessToken = null;
+        if (onAuthFailure) onAuthFailure();
+        notifyAuthListeners();
+      }
+    } else if (!cachedApkBridgeSession()) {
+      cachedAccessToken = null;
+      cachedProfile = null;
+      if (onAuthFailure) onAuthFailure();
+      notifyAuthListeners();
     }
+  });
+};
 
-    throw new Error(
-      `Phiên bản APK đang cài chưa có mô-đun Chrome Custom Tabs để quay về ứng dụng tự động. Hãy tải "Vá Mã Nguồn" trong mục Đóng Gói APK để build lại bản APK mới, hoặc bấm nút "Mở bản Render Web trên Chrome" bên dưới.`
-    );
+function cachedApkBridgeSession(): boolean {
+  return Boolean(isRunningInsideNativeApk() && cachedAccessToken && cachedProfile);
+}
+
+// Register native Android APK callback (receives URL fragment from system Chrome browser in memory)
+if (typeof window !== 'undefined') {
+  (window as any).__handleApkGoogleAuthCallback = (fragmentString: string) => {
+    try {
+      const cleanFragment = String(fragmentString || '').replace(/^#/, '');
+      const params = new URLSearchParams(cleanFragment);
+      const token = params.get('access_token');
+      if (!token) return;
+
+      cachedAccessToken = token;
+      cachedProfile = {
+        uid: params.get('uid') || 'apk_google_user',
+        displayName: params.get('name') || params.get('email') || 'Tài khoản Google',
+        email: params.get('email') || '',
+        photoURL: params.get('photo') || '',
+      };
+      notifyAuthListeners();
+      window.dispatchEvent(
+        new CustomEvent('pydroid:google-auth-updated', {
+          detail: { profile: cachedProfile, hasToken: true },
+        })
+      );
+    } catch (err) {
+      console.warn('APK Google auth callback parse warning:', err);
+    }
+  };
+}
+
+export function launchApkSystemBrowserAuth(): boolean {
+  if (typeof window === 'undefined') return false;
+  const bridge = (window as any).AndroidFileBridge;
+  if (bridge && typeof bridge.openExternalBrowser === 'function') {
+    const backendUrl = getRenderBackendUrl();
+    const targetUrl = `${backendUrl}/?apk_auth=1`;
+    return Boolean(bridge.openExternalBrowser(targetUrl));
+  }
+  return false;
+}
+
+export const googleSignIn = async (options?: {
+  forcePopup?: boolean;
+}): Promise<{ profile: GoogleAccountProfile; accessToken: string } | null> => {
+  // In native Android APK, Google blocks embedded WebViews (disallowed_useragent).
+  // Open system Chrome on the user's Render web app (client-side Firebase Auth) which returns via deep-link fragment.
+  if (isRunningInsideNativeApk() && !options?.forcePopup) {
+    const launched = launchApkSystemBrowserAuth();
+    if (launched) {
+      return null;
+    }
+  }
+
+  if (isSigningIn) {
+    return null;
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    const offlineError: any = new Error('Thiết bị đang ngoại tuyến (offline). Vui lòng kết nối mạng và thử lại.');
+    offlineError.code = 'auth/network-request-failed';
+    throw offlineError;
   }
 
   try {
-    if (!auth) {
-      throw new Error('Firebase Authentication chưa sẵn sàng.');
-    }
     isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
+    const result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      throw new Error('Không nhận được quyền truy cập Google từ cửa sổ đăng nhập.');
+      throw new Error('Không nhận được mã truy cập Google từ Firebase Auth.');
     }
 
     cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    cachedProfile = toProfile(result.user);
+    notifyAuthListeners();
+    return { profile: cachedProfile, accessToken: cachedAccessToken };
   } catch (error: any) {
     const code = error?.code || '';
-    const msg = String(error?.message || '');
-    const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
-    if (code === 'auth/unauthorized-domain') {
-      throw new Error(
-        `Tên miền "${hostname || 'hiện tại'}" chưa được cấp phép trong Firebase Console (Project ${firebaseConfig.projectId} ➔ Authentication ➔ Settings ➔ Authorized domains). Hãy thêm "${hostname}" vào danh sách tên miền được phép rồi thử lại.`
-      );
+    // Closing, cancelling, or encountering transient network/iframe blocks during OAuth is non-fatal
+    if (
+      code === 'auth/popup-closed-by-user' ||
+      code === 'auth/cancelled-popup-request' ||
+      code === 'auth/popup-blocked' ||
+      code === 'auth/network-request-failed'
+    ) {
+      console.info('Google Sign-In interrupted:', code);
+    } else {
+      console.warn('Google Sign-In warning:', code || error?.message || error);
     }
-    if (msg.includes('disallowed_useragent') || code === 'auth/web-storage-unsupported') {
-      throw new Error(
-        'Trình duyệt tích hợp hiện tại bị Google OAuth chặn đăng nhập (disallowed_useragent). Hãy mở ứng dụng trực tiếp bằng trình duyệt Chrome.'
-      );
-    }
-    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
-      throw new Error('Bạn đã đóng cửa sổ đăng nhập Google.');
-    }
-    if (code === 'auth/popup-blocked') {
-      throw new Error('Trình duyệt đang chặn cửa sổ bật lên. Vui lòng cho phép popup để đăng nhập Google.');
-    }
-    if (code === 'auth/operation-not-allowed') {
-      throw new Error('Nhà cung cấp đăng nhập Google chưa được kích hoạt trong Firebase Authentication.');
-    }
-    if (code === 'auth/network-request-failed') {
-      throw new Error('Lỗi kết nối mạng khi xác thực Google. Vui lòng kiểm tra Internet.');
-    }
-    throw new Error(msg ? `Lỗi đăng nhập Google (${code || 'auth'}): ${msg}` : 'Không thể đăng nhập bằng Google lúc này.');
+    throw error;
   } finally {
-    if (!isAndroidApkEnvironment()) {
-      isSigningIn = false;
-    }
+    isSigningIn = false;
   }
 };
 
@@ -400,16 +250,63 @@ export const getAccessToken = async (): Promise<string | null> => {
   return cachedAccessToken;
 };
 
-export const clearCachedAccessToken = (): void => {
-  cachedAccessToken = null;
+export const getCurrentGoogleProfile = (): GoogleAccountProfile | null => {
+  return cachedProfile;
 };
 
-export const logout = async (): Promise<void> => {
+export const clearAccessTokenInMemory = () => {
   cachedAccessToken = null;
-  cachedApkUser = null;
-  clearPendingApkPromise();
-  if (auth) {
-    await auth.signOut().catch(() => {});
-  }
-  activeCallbacks.onAuthSignedOutOrNeedsToken?.(null);
+  notifyAuthListeners();
 };
+
+export const logout = async () => {
+  cachedAccessToken = null;
+  cachedProfile = null;
+  try {
+    if (auth.currentUser) {
+      await auth.signOut();
+    }
+  } catch (_) {}
+  notifyAuthListeners();
+};
+
+export function formatGoogleAuthErrorMessage(err: any): string {
+  const code = err?.code || '';
+  const msg = err?.message || String(err || '');
+
+  if (code === 'auth/popup-closed-by-user') {
+    const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+    return inIframe
+      ? 'Cửa sổ đăng nhập Google đã bị đóng trước khi hoàn tất. Vui lòng thử bấm đăng nhập lại hoặc mở ứng dụng trong tab trình duyệt mới.'
+      : 'Bạn đã đóng cửa sổ đăng nhập Google trước khi hoàn tất. Vui lòng bấm đăng nhập lại nếu muốn kết nối.';
+  }
+  if (code === 'auth/popup-blocked') {
+    return 'Trình duyệt đang chặn cửa sổ bật lên (Popup). Vui lòng cho phép mở popup hoặc mở ứng dụng ở tab mới rồi bấm đăng nhập lại.';
+  }
+  if (code === 'auth/network-request-failed') {
+    const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+    return inIframe
+      ? 'Không thể kết nối máy chủ xác thực Google (mạng chậm hoặc trình duyệt đang chặn iframe bên thứ ba). Vui lòng kiểm tra Wi-Fi/4G, tắt trình chặn quảng cáo hoặc mở ứng dụng trong tab trình duyệt mới rồi thử lại.'
+      : 'Lỗi kết nối mạng khi xác thực Google. Vui lòng kiểm tra kết nối Internet, tắt trình chặn quảng cáo/VPN nếu có và thử lại.';
+  }
+  if (code === 'auth/unauthorized-domain') {
+    const host = typeof window !== 'undefined' ? window.location.hostname : '';
+    return `Tên miền "${host}" chưa được thêm vào Authorized Domains trong Firebase Console (Authentication -> Settings -> Authorized domains).`;
+  }
+  if (code === 'auth/cancelled-popup-request') {
+    return 'Yêu cầu đăng nhập trước đó đã bị hủy. Vui lòng thử lại.';
+  }
+  if (code === 'auth/web-storage-unsupported') {
+    return 'Trình duyệt đang tắt cookie/lưu trữ web (Web Storage). Vui lòng bật lại để đăng nhập Google.';
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return 'Phương thức đăng nhập Google chưa được bật trong Firebase Console (Authentication -> Sign-in method).';
+  }
+  if (code === 'auth/internal-error') {
+    return 'Lỗi nội bộ từ dịch vụ xác thực Google. Vui lòng tải lại trang và thử đăng nhập lại.';
+  }
+  if (msg.includes('disallowed_useragent')) {
+    return 'Google không cho phép đăng nhập bên trong WebView nhúng. Hệ thống sẽ mở trình duyệt Chrome để đăng nhập an toàn.';
+  }
+  return msg || 'Không thể đăng nhập tài khoản Google lúc này.';
+}
