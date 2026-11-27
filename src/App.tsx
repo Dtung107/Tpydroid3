@@ -33,6 +33,7 @@ import {
   ExecutionResult,
   AiDebugResult,
   SavedFile,
+  OpenedDeviceFile,
   ExecutionEngine,
   AppTheme,
 } from './types';
@@ -135,6 +136,7 @@ export default function App() {
     const saved = localStorage.getItem('pydroid_saved_files');
     return saved ? JSON.parse(saved) : [];
   });
+  const [openedDeviceFile, setOpenedDeviceFile] = useState<OpenedDeviceFile | null>(null);
 
   // Terminal state
   const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
@@ -826,6 +828,35 @@ export default function App() {
     showToast('Đã khôi phục danh sách bài tập mẫu mặc định!');
   };
 
+  // Listen for native Android SAF file open callback
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    (window as any).__handleApkOpenedFile = (payload: {
+      uri?: string;
+      name?: string;
+      content?: string;
+    }) => {
+      if (!payload || typeof payload.content !== 'string') return;
+      const openedName = (payload.name || 'untitled.py').trim() || 'untitled.py';
+      setCode(payload.content);
+      setFileName(openedName);
+      setOpenedDeviceFile({
+        source: 'android-saf',
+        name: openedName,
+        androidUri: payload.uri,
+        openedAt: Date.now(),
+      });
+      setActiveTab('editor');
+      setIsFileManagerOpen(false);
+      showToast(`📂 Đã mở "${openedName}" từ bộ nhớ máy!`);
+    };
+    return () => {
+      try {
+        delete (window as any).__handleApkOpenedFile;
+      } catch (_) {}
+    };
+  }, []);
+
   // File Manager actions
   const handleSaveCurrentFile = () => {
     const existing = savedFiles.find((f) => f.name === fileName);
@@ -842,29 +873,234 @@ export default function App() {
       };
       setSavedFiles((prev) => [newFile, ...prev]);
     }
-    showToast(`Đã lưu "${fileName}" vào bộ nhớ thiết bị!`);
+    showToast(`Đã lưu "${fileName}" vào danh sách ứng dụng!`);
   };
 
   const handleNewFile = () => {
     setCode('# File Python mới\n\n');
     setFileName('untitled.py');
+    setOpenedDeviceFile(null);
     setActiveTab('editor');
   };
 
   const handleLoadFile = (file: SavedFile) => {
     setCode(file.code);
     setFileName(file.name);
+    setOpenedDeviceFile({
+      source: 'local-memory',
+      name: file.name,
+      savedFileId: file.id,
+      openedAt: Date.now(),
+    });
     setActiveTab('editor');
   };
 
   const handleDeleteFile = (id: string) => {
     setSavedFiles((prev) => prev.filter((f) => f.id !== id));
+    setOpenedDeviceFile((prev) => (prev?.savedFileId === id ? null : prev));
   };
 
-  const handleUploadFile = (name: string, content: string) => {
+  const handleUploadFile = (
+    name: string,
+    content: string,
+    deviceMeta?: {
+      source: OpenedDeviceFile['source'];
+      handle?: any;
+      androidUri?: string;
+    }
+  ) => {
     setCode(content);
     setFileName(name);
+    setOpenedDeviceFile({
+      source: deviceMeta?.source || 'readonly-upload',
+      name,
+      handle: deviceMeta?.handle,
+      androidUri: deviceMeta?.androidUri,
+      openedAt: Date.now(),
+    });
     setActiveTab('editor');
+    showToast(`📂 Đã mở "${name}" từ bộ nhớ máy!`);
+  };
+
+  const handleOverwriteOpenedFile = async (): Promise<{ ok: boolean; message: string }> => {
+    if (!openedDeviceFile) {
+      return {
+        ok: false,
+        message: 'Chưa có file nào được mở từ bộ nhớ máy trước đó để ghi đè.',
+      };
+    }
+
+    const now = Date.now();
+    const targetName = openedDeviceFile.name || fileName || 'untitled.py';
+
+    // 1. Desktop / Modern Browser File System Access API (Direct handle overwrite)
+    if (openedDeviceFile.source === 'fsa' && openedDeviceFile.handle) {
+      try {
+        const handle = openedDeviceFile.handle;
+        if (typeof handle.queryPermission === 'function') {
+          let perm = await handle.queryPermission({ mode: 'readwrite' });
+          if (perm !== 'granted' && typeof handle.requestPermission === 'function') {
+            perm = await handle.requestPermission({ mode: 'readwrite' });
+          }
+          if (perm !== 'granted') {
+            return {
+              ok: false,
+              message: `Trình duyệt chưa cấp quyền ghi đè lên tệp "${targetName}".`,
+            };
+          }
+        }
+        const writable = await handle.createWritable();
+        await writable.write(code);
+        await writable.close();
+
+        setOpenedDeviceFile((prev) => (prev ? { ...prev, lastOverwrittenAt: now } : prev));
+        setSavedFiles((prev) =>
+          prev.map((f) =>
+            f.name === targetName ? { ...f, code, lastModified: now } : f
+          )
+        );
+        const msg = `✓ Đã Save (ghi đè) lên file "${targetName}" trên máy!`;
+        showToast(msg);
+        return { ok: true, message: msg };
+      } catch (err: any) {
+        return {
+          ok: false,
+          message: err?.message || `Không thể ghi đè lên tệp "${targetName}".`,
+        };
+      }
+    }
+
+    // 2. Android APK Storage Access Framework (SAF URI overwrite)
+    if (openedDeviceFile.source === 'android-saf' && openedDeviceFile.androidUri) {
+      try {
+        const bridge = (window as any).AndroidFileBridge;
+        if (bridge && typeof bridge.overwriteUriFile === 'function') {
+          const rawRes = bridge.overwriteUriFile(openedDeviceFile.androidUri, code);
+          const parsed = typeof rawRes === 'string' ? JSON.parse(rawRes) : rawRes;
+          if (parsed?.ok) {
+            setOpenedDeviceFile((prev) => (prev ? { ...prev, lastOverwrittenAt: now } : prev));
+            setSavedFiles((prev) =>
+              prev.map((f) =>
+                f.name === targetName ? { ...f, code, lastModified: now } : f
+              )
+            );
+            const msg = `✓ Đã Save (ghi đè) lên file "${targetName}" trong bộ nhớ máy!`;
+            showToast(msg);
+            return { ok: true, message: msg };
+          }
+          return {
+            ok: false,
+            message: parsed?.error || `Không thể ghi đè trực tiếp lên "${targetName}".`,
+          };
+        }
+        return {
+          ok: false,
+          message: 'Cầu nối Android không hỗ trợ ghi đè URI trực tiếp.',
+        };
+      } catch (err: any) {
+        return {
+          ok: false,
+          message: err?.message || `Lỗi ghi đè lên tệp "${targetName}".`,
+        };
+      }
+    }
+
+    // 3. In-app saved files list ("Các file đã lưu")
+    if (openedDeviceFile.source === 'local-memory' && openedDeviceFile.savedFileId) {
+      const targetId = openedDeviceFile.savedFileId;
+      const updatedName = fileName.trim() || targetName;
+      const exists = savedFiles.some((f) => f.id === targetId);
+      if (exists) {
+        setSavedFiles((prev) =>
+          prev.map((f) =>
+            f.id === targetId ? { ...f, name: updatedName, code, lastModified: now } : f
+          )
+        );
+      } else {
+        setSavedFiles((prev) => [
+          { id: targetId, name: updatedName, code, lastModified: now },
+          ...prev,
+        ]);
+      }
+      setOpenedDeviceFile((prev) =>
+        prev ? { ...prev, name: updatedName, lastOverwrittenAt: now } : prev
+      );
+      const msg = `✓ Đã Save (ghi đè) lên "${updatedName}" trong danh sách đã lưu!`;
+      showToast(msg);
+      return { ok: true, message: msg };
+    }
+
+    // 4. Fallback for <input type="file"> opened files (upgrade to FSA handle or save/download)
+    if (typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: targetName,
+          types: [
+            {
+              description: 'Tập tin Python (*.py)',
+              accept: { 'text/x-python': ['.py'] },
+            },
+          ],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(code);
+        await writable.close();
+        const savedName = handle.name || targetName;
+        setFileName(savedName);
+        setOpenedDeviceFile({
+          source: 'fsa',
+          name: savedName,
+          handle,
+          openedAt: openedDeviceFile.openedAt,
+          lastOverwrittenAt: now,
+        });
+        const msg = `✓ Đã Save (ghi đè) và liên kết file "${savedName}"!`;
+        showToast(msg);
+        return { ok: true, message: msg };
+      } catch (err: any) {
+        if (err?.name === 'AbortError') {
+          return { ok: false, message: 'Đã hủy thao tác lưu tệp.' };
+        }
+      }
+    }
+
+    if (typeof window !== 'undefined' && (window as any).AndroidFileBridge?.saveFile) {
+      try {
+        const ok = (window as any).AndroidFileBridge.saveFile(targetName, code);
+        if (ok) {
+          setOpenedDeviceFile((prev) => (prev ? { ...prev, lastOverwrittenAt: now } : prev));
+          const msg = `✓ Đã lưu "${targetName}" vào thư mục Download của điện thoại!`;
+          showToast(msg);
+          return { ok: true, message: msg };
+        }
+      } catch (_) {}
+    }
+
+    try {
+      const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = targetName;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        } catch (_) {}
+      }, 1000);
+      setOpenedDeviceFile((prev) => (prev ? { ...prev, lastOverwrittenAt: now } : prev));
+      const msg = `✓ Đã xuất ghi đè "${targetName}" về thư mục Tải xuống!`;
+      showToast(msg);
+      return { ok: true, message: msg };
+    } catch (err: any) {
+      return {
+        ok: false,
+        message: err?.message || `Không thể lưu tệp "${targetName}".`,
+      };
+    }
   };
 
   // 🛠️ Kích hoạt Bộ sửa lỗi tự động AI (Chỉ rõ dòng lỗi, nguyên nhân & sửa code hoàn chỉnh)
@@ -966,10 +1202,7 @@ export default function App() {
         isRunning={isRunning}
         onRun={handleRun}
         onStop={handleStop}
-        completedLessonsCount={lessons.filter((l) => l.completed).length}
-        totalLessonsCount={lessons.length}
         onOpenFileManager={() => setIsFileManagerOpen(true)}
-        onOpenStudy={() => setIsStudyOpen(true)}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onClearCode={handleClearCode}
         isFullscreen={isFullscreen}
@@ -1175,6 +1408,8 @@ export default function App() {
         savedFiles={savedFiles}
         onDeleteFile={handleDeleteFile}
         onUploadFile={handleUploadFile}
+        openedDeviceFile={openedDeviceFile}
+        onOverwriteOpenedFile={handleOverwriteOpenedFile}
         onOpenGoogleWorkspace={() => setIsGoogleWorkspaceOpen(true)}
         onApplySnippet={(snippetCode) => {
           setCode(snippetCode);

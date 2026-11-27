@@ -28,8 +28,9 @@ import {
   HardDriveDownload,
   HardDriveUpload,
   Database,
+  AlertCircle,
 } from 'lucide-react';
-import { SavedFile, SnippetItem, SnippetCategory } from '../types';
+import { SavedFile, SnippetItem, SnippetCategory, OpenedDeviceFile } from '../types';
 import {
   getAllVaultSnippets,
   saveVaultSnippet,
@@ -50,7 +51,17 @@ interface FileManagerModalProps {
   onNewFile: () => void;
   savedFiles: SavedFile[];
   onDeleteFile: (id: string) => void;
-  onUploadFile: (fileName: string, code: string) => void;
+  onUploadFile: (
+    fileName: string,
+    code: string,
+    deviceMeta?: {
+      source: OpenedDeviceFile['source'];
+      handle?: any;
+      androidUri?: string;
+    }
+  ) => void;
+  openedDeviceFile?: OpenedDeviceFile | null;
+  onOverwriteOpenedFile?: () => Promise<{ ok: boolean; message: string }>;
   onApplySnippet?: (code: string) => void;
   onInsertSnippet?: (code: string) => void;
   onOpenGoogleWorkspace?: () => void;
@@ -76,6 +87,8 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
   savedFiles,
   onDeleteFile,
   onUploadFile,
+  openedDeviceFile,
+  onOverwriteOpenedFile,
   onApplySnippet,
   onInsertSnippet,
   onOpenGoogleWorkspace,
@@ -87,6 +100,8 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
   const [editingName, setEditingName] = useState(currentFileName);
   const [isRenaming, setIsRenaming] = useState(false);
   const [downloadNotification, setDownloadNotification] = useState<string | null>(null);
+  const [overwriteError, setOverwriteError] = useState<string | null>(null);
+  const [isOverwriting, setIsOverwriting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Snippet Vault states
@@ -108,12 +123,15 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
   const [vaultNotice, setVaultNotice] = useState<string | null>(null);
   const vaultImportInputRef = useRef<HTMLInputElement>(null);
 
-  // Load vault snippets whenever modal opens or tab switches to vault
+  // Load vault snippets & sync modal states whenever modal opens
   useEffect(() => {
     if (isOpen) {
+      setEditingName(currentFileName);
+      setIsRenaming(false);
+      setOverwriteError(null);
       loadSnippets();
     }
-  }, [isOpen]);
+  }, [isOpen, currentFileName]);
 
   const loadSnippets = async () => {
     setIsLoadingVault(true);
@@ -290,6 +308,70 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
     } catch (_) {}
   };
 
+  const handleOverwriteSave = async () => {
+    if (!onOverwriteOpenedFile || !openedDeviceFile) return;
+    setIsOverwriting(true);
+    setOverwriteError(null);
+    setDownloadNotification(null);
+    try {
+      const result = await onOverwriteOpenedFile();
+      if (result.ok) {
+        setDownloadNotification(result.message);
+        setTimeout(() => setDownloadNotification(null), 4000);
+      } else {
+        setOverwriteError(result.message);
+        setTimeout(() => setOverwriteError(null), 5000);
+      }
+    } catch (err: any) {
+      setOverwriteError(err?.message || 'Lỗi khi ghi đè lên tệp đã mở.');
+      setTimeout(() => setOverwriteError(null), 5000);
+    } finally {
+      setIsOverwriting(false);
+    }
+  };
+
+  const handleOpenDeviceFile = async () => {
+    // 1. Native Android APK SAF Picker (supports persistent write-back / overwrite)
+    if (typeof window !== 'undefined' && (window as any).AndroidFileBridge?.openEditableFile) {
+      try {
+        const launched = (window as any).AndroidFileBridge.openEditableFile();
+        if (launched) return;
+      } catch (err) {
+        console.warn('Android SAF openEditableFile error:', err);
+      }
+    }
+
+    // 2. Modern Browser File System Access API (supports direct write-back / overwrite)
+    if (typeof window !== 'undefined' && 'showOpenFilePicker' in window) {
+      try {
+        const [handle] = await (window as any).showOpenFilePicker({
+          multiple: false,
+          types: [
+            {
+              description: 'Tập tin Python (*.py)',
+              accept: {
+                'text/x-python': ['.py'],
+                'text/plain': ['.py', '.txt'],
+              },
+            },
+          ],
+        });
+        if (!handle) return;
+        const file = await handle.getFile();
+        const content = await file.text();
+        onUploadFile(file.name, content, { source: 'fsa', handle });
+        onClose();
+        return;
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        // Fall through to standard <input type="file"> (e.g. inside sandboxed iframe)
+      }
+    }
+
+    // 3. Standard file input fallback
+    fileInputRef.current?.click();
+  };
+
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -297,7 +379,7 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
     const reader = new FileReader();
     reader.onload = (event) => {
       const content = event.target?.result as string;
-      onUploadFile(file.name, content);
+      onUploadFile(file.name, content, { source: 'readonly-upload' });
       onClose();
     };
     reader.readAsText(file);
@@ -575,6 +657,19 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <span className="text-gray-400 text-xs">Tập tin đang mở:</span>
                   <div className="flex items-center space-x-1.5 flex-wrap gap-1">
+                    {openedDeviceFile && onOverwriteOpenedFile && (
+                      <button
+                        type="button"
+                        onClick={handleOverwriteSave}
+                        disabled={isOverwriting}
+                        className="flex items-center space-x-1 text-xs text-slate-950 font-extrabold py-1 px-2.5 rounded-lg bg-emerald-400 hover:bg-emerald-300 disabled:opacity-60 border border-emerald-200 transition cursor-pointer active:scale-95 shadow-sm"
+                        title={`Save (ghi đè) nội dung Editor lên file "${openedDeviceFile.name}"`}
+                      >
+                        <Save className="w-3.5 h-3.5" />
+                        <span>{isOverwriting ? 'Đang lưu...' : 'Save (Ghi đè)'}</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={handleCopyCode}
@@ -639,6 +734,13 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                   </div>
                 )}
 
+                {overwriteError && (
+                  <div className="p-2 rounded-lg bg-rose-500/15 border border-rose-500/40 text-rose-300 text-xs flex items-center space-x-1.5 animate-in fade-in">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-400" />
+                    <span>{overwriteError}</span>
+                  </div>
+                )}
+
                 {isRenaming ? (
                   <div className="flex items-center space-x-2">
                     <input
@@ -672,6 +774,27 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                     </button>
                   </div>
                 )}
+
+                {openedDeviceFile && (
+                  <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-[11px] text-emerald-200">
+                    <div className="flex items-center space-x-1.5 min-w-0">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+                      <span className="truncate">
+                        {openedDeviceFile.source === 'fsa' || openedDeviceFile.source === 'android-saf'
+                          ? `Liên kết file gốc trên máy: `
+                          : openedDeviceFile.source === 'local-memory'
+                          ? `File mở từ bộ nhớ đã lưu: `
+                          : `File mở từ máy: `}
+                        <strong className="font-mono text-emerald-300">{openedDeviceFile.name}</strong>
+                      </span>
+                    </div>
+                    {openedDeviceFile.lastOverwrittenAt && (
+                      <span className="text-[10px] text-emerald-400/90 shrink-0 font-mono">
+                        Đã lưu {new Date(openedDeviceFile.lastOverwrittenAt).toLocaleTimeString('vi-VN')}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Quick Action Grid */}
@@ -683,12 +806,12 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                   }}
                   className="p-3 bg-[#20202e] hover:bg-[#28283a] rounded-xl border border-[#33334a] flex items-center space-x-2 transition text-left active:scale-95 cursor-pointer"
                 >
-                  <div className="p-2 bg-emerald-500/20 text-emerald-300 rounded-lg">
+                  <div className="p-2 bg-emerald-500/20 text-emerald-300 rounded-lg shrink-0">
                     <FilePlus className="w-4 h-4" />
                   </div>
-                  <div>
-                    <div className="font-bold text-gray-200">Tạo File Mới</div>
-                    <div className="text-[10px] text-gray-400">Tạo trang mã trắng</div>
+                  <div className="min-w-0">
+                    <div className="font-bold text-gray-200 truncate">Tạo File Mới</div>
+                    <div className="text-[10px] text-gray-400 truncate">Tạo trang mã trắng</div>
                   </div>
                 </button>
 
@@ -699,25 +822,62 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                   }}
                   className="p-3 bg-[#20202e] hover:bg-[#28283a] rounded-xl border border-[#33334a] flex items-center space-x-2 transition text-left active:scale-95 cursor-pointer"
                 >
-                  <div className="p-2 bg-sky-500/20 text-sky-300 rounded-lg">
+                  <div className="p-2 bg-sky-500/20 text-sky-300 rounded-lg shrink-0">
                     <Save className="w-4 h-4" />
                   </div>
-                  <div>
-                    <div className="font-bold text-gray-200">Lưu Trữ File</div>
-                    <div className="text-[10px] text-gray-400">Lưu vào bộ nhớ máy</div>
+                  <div className="min-w-0">
+                    <div className="font-bold text-gray-200 truncate">Lưu Trữ File</div>
+                    <div className="text-[10px] text-gray-400 truncate">Lưu vào danh sách app</div>
                   </div>
                 </button>
 
                 <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-3 bg-[#20202e] hover:bg-[#28283a] rounded-xl border border-[#33334a] flex items-center space-x-2 transition text-left active:scale-95 col-span-2 cursor-pointer"
+                  type="button"
+                  onClick={handleOverwriteSave}
+                  disabled={!openedDeviceFile || !onOverwriteOpenedFile || isOverwriting}
+                  className={`p-3 rounded-xl border flex items-center space-x-2 transition text-left ${
+                    openedDeviceFile && onOverwriteOpenedFile
+                      ? 'bg-emerald-950/50 hover:bg-emerald-900/60 border-emerald-500/50 active:scale-95 cursor-pointer shadow-sm'
+                      : 'bg-[#191924] border-[#29293b] opacity-55 cursor-not-allowed'
+                  }`}
+                  title={
+                    openedDeviceFile
+                      ? `Save (ghi đè) nội dung Editor hiện tại lên file "${openedDeviceFile.name}"`
+                      : 'Hãy mở một file từ bộ nhớ máy trước để dùng chức năng Save (ghi đè)'
+                  }
                 >
-                  <div className="p-2 bg-purple-500/20 text-purple-300 rounded-lg">
+                  <div
+                    className={`p-2 rounded-lg shrink-0 ${
+                      openedDeviceFile
+                        ? 'bg-emerald-500/25 text-emerald-300'
+                        : 'bg-gray-700/30 text-gray-500'
+                    }`}
+                  >
+                    <Save className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-bold text-gray-100 truncate">
+                      {isOverwriting ? 'Đang Ghi Đè...' : 'Save (Ghi đè)'}
+                    </div>
+                    <div className="text-[10px] text-gray-400 truncate">
+                      {openedDeviceFile
+                        ? `Ghi đè → ${openedDeviceFile.name}`
+                        : 'Chưa mở file từ bộ nhớ máy'}
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleOpenDeviceFile}
+                  className="p-3 bg-[#20202e] hover:bg-[#28283a] rounded-xl border border-[#33334a] flex items-center space-x-2 transition text-left active:scale-95 cursor-pointer"
+                >
+                  <div className="p-2 bg-purple-500/20 text-purple-300 rounded-lg shrink-0">
                     <Upload className="w-4 h-4" />
                   </div>
-                  <div>
-                    <div className="font-bold text-gray-200">Mở File .py từ Điện thoại</div>
-                    <div className="text-[10px] text-gray-400">Chọn file .py từ bộ nhớ Android để nạp vào IDE</div>
+                  <div className="min-w-0">
+                    <div className="font-bold text-gray-200 truncate">Mở File từ Máy</div>
+                    <div className="text-[10px] text-gray-400 truncate">Chọn file .py từ điện thoại</div>
                   </div>
                 </button>
                 <input

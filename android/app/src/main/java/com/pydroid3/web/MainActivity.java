@@ -1,8 +1,10 @@
 package com.pydroid3.web;
 
+import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Point;
 import android.graphics.Rect;
@@ -12,11 +14,15 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.view.View;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.widget.Toast;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
@@ -24,8 +30,10 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 import com.getcapacitor.BridgeActivity;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import org.json.JSONObject;
@@ -37,6 +45,7 @@ public class MainActivity extends BridgeActivity {
     private int lastPadTop = -1;
     private int lastPadRight = -1;
     private int lastPadBottom = -1;
+    private ActivityResultLauncher<Intent> openEditableFileLauncher;
 
     private int[] getScreenSizePx() {
         try {
@@ -217,6 +226,152 @@ public class MainActivity extends BridgeActivity {
                 return false;
             }
         }
+
+        @JavascriptInterface
+        public boolean openEditableFile() {
+            try {
+                if (openEditableFileLauncher == null) return false;
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/x-python", "text/plain", "application/octet-stream"});
+                intent.addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                );
+                runOnUiThread(() -> openEditableFileLauncher.launch(intent));
+                return true;
+            } catch (Exception e) {
+                final String errorMsg = e.getMessage();
+                runOnUiThread(() -> Toast.makeText(context, "Không thể mở trình chọn tệp: " + errorMsg, Toast.LENGTH_SHORT).show());
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public String overwriteUriFile(String uriString, String content) {
+            JSONObject res = new JSONObject();
+            try {
+                if (uriString == null || uriString.trim().isEmpty()) {
+                    res.put("ok", false);
+                    res.put("error", "Không tìm thấy đường dẫn tệp gốc để ghi đè.");
+                    return res.toString();
+                }
+                Uri uri = Uri.parse(uriString);
+                byte[] bytes = (content != null ? content : "").getBytes(StandardCharsets.UTF_8);
+                boolean written = false;
+                Exception lastErr = null;
+
+                // 1. Preferred mode "wt" (write + truncate)
+                try (OutputStream os = context.getContentResolver().openOutputStream(uri, "wt")) {
+                    if (os != null) {
+                        os.write(bytes);
+                        os.flush();
+                        written = true;
+                    }
+                } catch (Exception e) {
+                    lastErr = e;
+                }
+
+                // 2. ParcelFileDescriptor "rw" with explicit channel truncate(0)
+                if (!written) {
+                    try (ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(uri, "rw")) {
+                        if (pfd != null) {
+                            try (FileOutputStream fos = new FileOutputStream(pfd.getFileDescriptor())) {
+                                fos.getChannel().truncate(0);
+                                fos.write(bytes);
+                                fos.flush();
+                                written = true;
+                            }
+                        }
+                    } catch (Exception e) {
+                        lastErr = e;
+                    }
+                }
+
+                // 3. Fallback mode "w"
+                if (!written) {
+                    try (OutputStream os = context.getContentResolver().openOutputStream(uri, "w")) {
+                        if (os != null) {
+                            os.write(bytes);
+                            os.flush();
+                            written = true;
+                        }
+                    } catch (Exception e) {
+                        lastErr = e;
+                    }
+                }
+
+                if (!written) {
+                    res.put("ok", false);
+                    res.put("error", lastErr != null && lastErr.getMessage() != null
+                        ? lastErr.getMessage()
+                        : "Thiết bị từ chối quyền ghi đè trực tiếp lên tệp này.");
+                    return res.toString();
+                }
+
+                res.put("ok", true);
+                return res.toString();
+            } catch (Exception e) {
+                try {
+                    res.put("ok", false);
+                    res.put("error", e.getMessage() != null ? e.getMessage() : "Lỗi khi ghi đè tệp.");
+                } catch (Exception ignored) {}
+                return res.toString();
+            }
+        }
+    }
+
+    private String getDisplayNameFromUri(Uri uri) {
+        String name = null;
+        try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) {
+                    name = cursor.getString(idx);
+                }
+            }
+        } catch (Exception ignored) {}
+        if (name == null || name.trim().isEmpty()) {
+            String segment = uri.getLastPathSegment();
+            if (segment != null && !segment.trim().isEmpty()) {
+                int slash = segment.lastIndexOf('/');
+                name = slash >= 0 ? segment.substring(slash + 1) : segment;
+            }
+        }
+        return (name == null || name.trim().isEmpty()) ? "untitled.py" : name.trim();
+    }
+
+    private void dispatchOpenedSafFile(Uri uri) {
+        try {
+            String fileName = getDisplayNameFromUri(uri);
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            try (InputStream is = getContentResolver().openInputStream(uri)) {
+                if (is == null) {
+                    runOnUiThread(() -> Toast.makeText(this, "Không thể đọc nội dung tệp đã chọn.", Toast.LENGTH_SHORT).show());
+                    return;
+                }
+                byte[] chunk = new byte[8192];
+                int read;
+                while ((read = is.read(chunk)) != -1) {
+                    buffer.write(chunk, 0, read);
+                }
+            }
+            String content = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+            JSONObject payload = new JSONObject();
+            payload.put("uri", uri.toString());
+            payload.put("name", fileName);
+            payload.put("content", content);
+
+            final String js = "if (window.__handleApkOpenedFile) { window.__handleApkOpenedFile(" + payload.toString() + "); }";
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(js, null));
+            }
+        } catch (Exception e) {
+            final String msg = e.getMessage();
+            runOnUiThread(() -> Toast.makeText(this, "Lỗi đọc tệp: " + msg, Toast.LENGTH_SHORT).show());
+        }
     }
 
     private void registerBridgeInterface() {
@@ -242,6 +397,24 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        openEditableFileLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+                if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null && result.getData().getData() != null) {
+                    Uri uri = result.getData().getData();
+                    try {
+                        int takeFlags = result.getData().getFlags()
+                            & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                        if (takeFlags == 0) {
+                            takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+                        }
+                        getContentResolver().takePersistableUriPermission(uri, takeFlags);
+                    } catch (Exception ignored) {}
+                    dispatchOpenedSafFile(uri);
+                }
+            }
+        );
 
         int bgDark = Color.parseColor("#13131c");
         getWindow().setBackgroundDrawable(new ColorDrawable(bgDark));

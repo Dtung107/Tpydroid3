@@ -6,7 +6,6 @@ import {
   Code2,
   FolderOpen,
   Trash2,
-  GraduationCap,
   Settings,
   Sparkles,
   Cpu,
@@ -30,10 +29,7 @@ interface TopBarProps {
   isRunning: boolean;
   onRun: () => void;
   onStop: () => void;
-  completedLessonsCount: number;
-  totalLessonsCount: number;
   onOpenFileManager: () => void;
-  onOpenStudy: () => void;
   onOpenSettings: () => void;
   onClearCode: () => void;
   isFullscreen: boolean;
@@ -56,10 +52,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   isRunning,
   onRun,
   onStop,
-  completedLessonsCount,
-  totalLessonsCount,
   onOpenFileManager,
-  onOpenStudy,
   onOpenSettings,
   onClearCode,
   isFullscreen,
@@ -283,19 +276,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           </button>
         )}
 
-        {/* 2. 🟢 Nút Kho bài tập & Kết quả học tập */}
-        <button
-          onClick={onOpenStudy}
-          className="h-8 min-w-[38px] px-2.5 flex items-center justify-center bg-gradient-to-b from-emerald-500 to-green-600 hover:from-emerald-400 hover:to-green-500 active:bg-emerald-700 text-white rounded-lg border-2 border-emerald-400 shadow-[0_2px_0_0_#064e3b] hover:border-emerald-300 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer relative group"
-          title={`Kho bài tập & Kết quả học tập (${completedLessonsCount}/${totalLessonsCount} bài đã xong)`}
-        >
-          <GraduationCap className="w-4 h-4 text-white fill-current/20 group-hover:scale-110 transition-transform drop-shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
-          {completedLessonsCount > 0 && (
-            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-yellow-400 rounded-full border border-black shadow" />
-          )}
-        </button>
-
-        {/* 3. 📁 Nút Quản lý tập tin .py */}
+        {/* 2. 📁 Nút Quản lý tập tin .py */}
         <button
           onClick={onOpenFileManager}
           className="h-8 min-w-[38px] px-2.5 flex items-center justify-center bg-gradient-to-b from-[#113a60] to-[#0c2944] hover:from-[#174e82] hover:to-[#0f3659] text-sky-300 hover:text-white rounded-lg border-2 border-sky-400 shadow-[0_2px_0_0_#071b2d] hover:border-sky-300 transition-all duration-100 active:translate-y-0.5 active:shadow-none shrink-0 cursor-pointer group"

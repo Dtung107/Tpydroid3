@@ -81,6 +81,16 @@ export interface SavedFile {
   lastModified: number;
 }
 
+export interface OpenedDeviceFile {
+  source: 'fsa' | 'android-saf' | 'local-memory' | 'readonly-upload';
+  name: string;
+  handle?: any;
+  androidUri?: string;
+  savedFileId?: string;
+  openedAt: number;
+  lastOverwrittenAt?: number;
+}
+
 export type SnippetCategory = 'template' | 'algorithm' | 'utility' | 'data' | 'custom';
 
 export interface SnippetItem {
