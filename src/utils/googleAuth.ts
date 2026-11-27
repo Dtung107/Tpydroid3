@@ -14,7 +14,7 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-export const DEFAULT_RENDER_BACKEND_URL = 'https://pydroid3-android.onrender.com';
+export const DEFAULT_RENDER_BACKEND_URL = 'https://tpydroid3-2.onrender.com';
 const RENDER_BACKEND_STORAGE_KEY = 'pydroid_render_backend_url';
 
 export const GOOGLE_WORKSPACE_SCOPES = [
